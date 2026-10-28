@@ -157,6 +157,53 @@ class CursorDB:
         except json.JSONDecodeError:
             return None
 
+    def table_exists(self, table: str) -> bool:
+        """Return whether a table exists in the database."""
+        conn = self._ensure_read_copy()
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    def get_composer_headers(self, include_subagents: bool = False) -> list[dict]:
+        """Read headers from Cursor's dedicated modern SQL table."""
+        conn = self._ensure_read_copy()
+        if not self.table_exists("composerHeaders"):
+            return []
+
+        where = "" if include_subagents else "WHERE COALESCE(isSubagent, 0) = 0"
+        rows = conn.execute(
+            f"""SELECT composerId, workspaceId, createdAt, lastUpdatedAt,
+                       isArchived, isSubagent, recency, checkpointAt, value,
+                       subagentTypeName
+                FROM composerHeaders {where}"""
+        ).fetchall()
+        headers = []
+        for row in rows:
+            try:
+                entry = json.loads(row[8]) if row[8] else {}
+            except (TypeError, json.JSONDecodeError):
+                entry = {}
+            if not isinstance(entry, dict):
+                entry = {}
+            entry.update({
+                "composerId": row[0],
+                "workspaceIdentifier": {
+                    **entry.get("workspaceIdentifier", {}),
+                    "id": row[1],
+                },
+                "createdAt": row[2] or entry.get("createdAt", 0),
+                "lastUpdatedAt": row[3] or entry.get("lastUpdatedAt", 0),
+                "isArchived": bool(row[4]),
+                "isSubagent": bool(row[5]),
+                "recency": row[6],
+                "checkpointAt": row[7],
+                "subagentTypeName": row[9],
+            })
+            headers.append(entry)
+        return headers
+
     # ── Write operations (on original file) ─────────────────────────
 
     def _get_write_conn(self) -> sqlite3.Connection:
@@ -211,6 +258,45 @@ class CursorDB:
             for key, data in items
         ]
         self.write_batch(serialized, table=table)
+
+    def write_composer_header(self, entry: dict, workspace_id: str) -> None:
+        """Insert or update a top-level header in the modern SQL table."""
+        if not self.table_exists("composerHeaders"):
+            return
+        composer_id = entry["composerId"]
+        created_at = entry.get("createdAt", 0)
+        last_updated_at = entry.get("lastUpdatedAt") or None
+        archived = int(bool(entry.get("isArchived", False)))
+        recency = entry.get("recency") or last_updated_at or created_at
+        conn = self._get_write_conn()
+        conn.execute(
+            """INSERT INTO composerHeaders
+                   (composerId, workspaceId, createdAt, lastUpdatedAt,
+                    isArchived, isSubagent, recency, checkpointAt, value,
+                    subagentTypeName)
+               VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, '')
+               ON CONFLICT(composerId) DO UPDATE SET
+                   workspaceId=excluded.workspaceId,
+                   createdAt=excluded.createdAt,
+                   lastUpdatedAt=excluded.lastUpdatedAt,
+                   isArchived=excluded.isArchived,
+                   isSubagent=0,
+                   recency=excluded.recency,
+                   checkpointAt=excluded.checkpointAt,
+                   value=excluded.value,
+                   subagentTypeName=''""",
+            (
+                composer_id,
+                workspace_id,
+                created_at,
+                last_updated_at,
+                archived,
+                recency,
+                entry.get("checkpointAt"),
+                json.dumps(entry, separators=(",", ":")),
+            ),
+        )
+        conn.commit()
 
     def delete_keys(self, keys: list[str], table: str = "cursorDiskKV") -> int:
         """Delete multiple keys in a single transaction on the ORIGINAL database.
