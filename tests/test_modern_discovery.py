@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cursor_saves import db, export, importer, paths
+from cursor_saves import cli, db, export, importer, paths
 
 
 def create_db(path: Path, modern: bool = False) -> None:
@@ -253,6 +253,25 @@ class LegacyDiscoveryTests(unittest.TestCase):
                 )
                 self.assertEqual([item["composerId"] for item in conversations], ["legacy"])
                 paths.invalidate_headers_cache()
+
+
+class ConversationSelectionTests(unittest.TestCase):
+    def test_selection_preserves_newest_first_discovery_order(self) -> None:
+        conversations = [
+            {"id": "new", "name": "Newest", "lastUpdated": "2026-10-28 12:00 UTC"},
+            {"id": "old", "name": "Old unnamed", "lastUpdated": "unknown"},
+        ]
+        with (
+            patch.object(export, "list_conversations", return_value=conversations),
+            patch(
+                "cursor_saves.interactive.select_conversations",
+                return_value=["new", "old"],
+            ) as select,
+        ):
+            result = cli._select_conversations("/project")
+
+        self.assertEqual(result, ["new", "old"])
+        self.assertEqual(select.call_args.args[0], conversations)
 
 
 if __name__ == "__main__":

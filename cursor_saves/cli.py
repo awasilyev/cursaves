@@ -604,8 +604,6 @@ def _select_conversations(project_path: str, prompt: str = "push", workspace_dir
         print(f"No conversations found for {project_path}")
         return []
 
-    conversations.sort(key=lambda c: c.get("lastUpdated", ""), reverse=True)
-
     project_name = os.path.basename(os.path.normpath(project_path)) or project_path
     print(f"\n  {project_name}: {len(conversations)} conversation(s)\n")
 
