@@ -430,7 +430,12 @@ def import_snapshot(
         backup_path = db.backup_db(ws_db_path)
         print(f"  Backed up workspace DB to {backup_path.name}")
 
-    _register_in_workspace(composer_id, composer_data, ws_dir)
+    _register_in_workspace(
+        composer_id,
+        composer_data,
+        ws_dir,
+        composer_header=snapshot.get("composerHeader"),
+    )
 
     # ── Step 4: Verify writes ─────────────────────────────────────────
     verify_cdb = db.CursorDB(global_db_path)
@@ -779,10 +784,15 @@ def import_all_snapshots(
 # ── Local workspace copy ───────────────────────────────────────────────
 
 
-def _build_composer_header_entry(composer_id: str, composer_data: dict) -> dict:
+def _build_composer_header_entry(
+    composer_id: str,
+    composer_data: dict,
+    composer_header: Optional[dict] = None,
+) -> dict:
     """Build a composer header entry suitable for both allComposers and
     composer.composerHeaders."""
-    return {
+    entry = dict(composer_header or {})
+    entry.update({
         "type": "head",
         "composerId": composer_id,
         "lastUpdatedAt": composer_data.get("lastUpdatedAt", composer_data.get("createdAt", 0)),
@@ -794,7 +804,7 @@ def _build_composer_header_entry(composer_id: str, composer_data: dict) -> dict:
         "totalLinesRemoved": composer_data.get("totalLinesRemoved", 0),
         "filesChangedCount": composer_data.get("filesChangedCount", 0),
         "subtitle": composer_data.get("subtitle", ""),
-        "isArchived": False,
+        "isArchived": bool((composer_header or {}).get("isArchived", False)),
         "isDraft": False,
         "isWorktree": False,
         "isSpec": False,
@@ -802,7 +812,9 @@ def _build_composer_header_entry(composer_id: str, composer_data: dict) -> dict:
         "numSubComposers": len(composer_data.get("subComposerIds", [])),
         "referencedPlans": [],
         "name": composer_data.get("name", "Imported conversation"),
-    }
+    })
+    entry.pop("_workspaceDir", None)
+    return entry
 
 
 def _build_workspace_identifier(ws_dir: Path) -> dict:
@@ -852,6 +864,7 @@ def _register_in_global_headers(
     composer_id: str,
     composer_data: dict,
     ws_dir: Path,
+    composer_header: Optional[dict] = None,
 ) -> None:
     """Register a conversation in the global composer.composerHeaders index.
 
@@ -861,6 +874,13 @@ def _register_in_global_headers(
     global_db_path = paths.get_global_db_path()
     global_cdb = db.CursorDB(global_db_path)
     try:
+        entry = _build_composer_header_entry(composer_id, composer_data, composer_header)
+        entry["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
+
+        # Recent Cursor versions use a dedicated SQL table.
+        global_cdb.write_composer_header(entry, ws_dir.name)
+
+        # Keep the older JSON index working for older Cursor versions.
         headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
         if headers is None:
             headers = {"allComposers": []}
@@ -869,8 +889,6 @@ def _register_in_global_headers(
         existing_ids = {c.get("composerId") for c in all_composers}
 
         if composer_id not in existing_ids:
-            entry = _build_composer_header_entry(composer_id, composer_data)
-            entry["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
             all_composers.append(entry)
             headers["allComposers"] = all_composers
             global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
@@ -883,6 +901,7 @@ def _register_in_workspace(
     composer_id: str,
     composer_data: dict,
     ws_dir: Path,
+    composer_header: Optional[dict] = None,
 ) -> bool:
     """Register a conversation in a workspace's sidebar.
 
@@ -908,7 +927,7 @@ def _register_in_workspace(
             existing_ids = {c.get("composerId") for c in all_composers}
 
             if composer_id not in existing_ids:
-                entry = _build_composer_header_entry(composer_id, composer_data)
+                entry = _build_composer_header_entry(composer_id, composer_data, composer_header)
                 all_composers.append(entry)
                 existing["allComposers"] = all_composers
 
@@ -928,9 +947,13 @@ def _register_in_workspace(
 
         ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
 
-        # Cursor 3.0+: register in the global headers index
-        if is_migrated:
-            _register_in_global_headers(composer_id, composer_data, ws_dir)
+        # Cursor 3.0+: register in the global headers index. A workspace may
+        # still contain an old allComposers value after Cursor creates the
+        # dedicated global SQL table, so detect the global schema as well.
+        with db.CursorDB(paths.get_global_db_path()) as global_cdb:
+            has_modern_headers = global_cdb.table_exists("composerHeaders")
+        if is_migrated or has_modern_headers:
+            _register_in_global_headers(composer_id, composer_data, ws_dir, composer_header)
 
         return True
     finally:
@@ -1486,6 +1509,7 @@ def migrate_to_global_headers(
     global_cdb = db.CursorDB(global_db_path)
     try:
         headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
+        modern_headers = global_cdb.get_composer_headers()
     finally:
         global_cdb.close()
     if headers is None:
@@ -1494,6 +1518,7 @@ def migrate_to_global_headers(
     existing_ids = {
         c.get("composerId") for c in headers.get("allComposers", [])
     }
+    existing_ids.update(c.get("composerId") for c in modern_headers)
 
     # Scan all workspaces for chats not in the global index
     all_ws = paths.list_all_workspaces()
@@ -1549,7 +1574,11 @@ def migrate_to_global_headers(
 
             entry = None
             if cid in local_metadata:
-                entry = _build_composer_header_entry(cid, local_metadata[cid])
+                entry = _build_composer_header_entry(
+                    cid,
+                    local_metadata[cid],
+                    composer_header=local_metadata[cid],
+                )
 
             to_migrate.append((entry, cid, ws_dir, ws_identifier))
             existing_ids.add(cid)
@@ -1598,6 +1627,10 @@ def migrate_to_global_headers(
     headers["allComposers"].extend(final_entries)
     write_cdb = db.CursorDB(global_db_path)
     try:
+        for entry in final_entries:
+            workspace_id = entry.get("workspaceIdentifier", {}).get("id")
+            if workspace_id:
+                write_cdb.write_composer_header(entry, workspace_id)
         write_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
     finally:
         write_cdb.close()

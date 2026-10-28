@@ -89,6 +89,31 @@ def _decode_ssh_host(host: str) -> str:
     return host
 
 
+def _parse_workspace_location(data: dict) -> Optional[tuple[str, str, Optional[str], str]]:
+    """Return (uri, path, host, type) from a workspace.json object."""
+    is_workspace = bool(data.get("workspace") and not data.get("folder"))
+    uri = data.get("workspace") if is_workspace else data.get("folder", "")
+    if not uri:
+        return None
+    if uri.startswith("file://"):
+        return uri, uri[len("file://"):].replace("%20", " "), None, (
+            "workspace" if is_workspace else "local"
+        )
+    if uri.startswith("vscode-remote://"):
+        parts = uri.split("/", 3)
+        if len(parts) < 4:
+            return None
+        authority = parts[2]
+        if "%2B" in authority:
+            host = authority.split("%2B", 1)[1]
+        elif "+" in authority:
+            host = authority.split("+", 1)[1]
+        else:
+            host = None
+        return uri, "/" + parts[3], _decode_ssh_host(host) if host else None, "ssh"
+    return None
+
+
 def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     """Find all workspace directories that map to a given project path.
 
@@ -111,22 +136,10 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             continue
         try:
             data = json.loads(ws_json.read_text())
-            folder_uri = data.get("folder", "")
-            # Handle file:// URIs
-            if folder_uri.startswith("file://"):
-                folder_path = folder_uri[len("file://") :]
-                # URL-decode common escapes
-                folder_path = folder_path.replace("%20", " ")
-            elif folder_uri.startswith("vscode-remote://"):
-                # SSH remote workspace - extract the path portion
-                # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                parts = folder_uri.split("/", 3)
-                if len(parts) >= 4:
-                    folder_path = "/" + parts[3]
-                else:
-                    continue
-            else:
+            location = _parse_workspace_location(data)
+            if not location:
                 continue
+            _, folder_path, _, _ = location
 
             if os.path.normpath(folder_path) == target:
                 matches.append(ws_dir)
@@ -182,47 +195,10 @@ def list_all_workspaces() -> list[dict]:
         try:
             data = json.loads(ws_json.read_text())
 
-            ws_type = "local"
-            host = None
-            folder_path = ""
-            folder_uri = ""
-
-            # workspace .code-workspace: uses "workspace" key instead of "folder"
-            if "workspace" in data and not data.get("folder"):
-                ws_uri = data["workspace"]
-                if ws_uri.startswith("file://"):
-                    folder_uri = ws_uri
-                    folder_path = ws_uri[len("file://") :]
-                    folder_path = folder_path.replace("%20", " ")
-                    ws_type = "workspace"
-                else:
-                    continue
-            else:
-                folder_uri = data.get("folder", "")
-                if not folder_uri:
-                    continue
-
-                if folder_uri.startswith("file://"):
-                    folder_path = folder_uri[len("file://") :]
-                    folder_path = folder_path.replace("%20", " ")
-                elif folder_uri.startswith("vscode-remote://"):
-                    ws_type = "ssh"
-                    # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                    authority = folder_uri.split("/")[2]  # ssh-remote%2B<host>
-                    if "%2B" in authority:
-                        host = authority.split("%2B", 1)[1]
-                    elif "+" in authority:
-                        host = authority.split("+", 1)[1]
-                    # Decode the host if it's hex-encoded JSON (e.g. {"hostName":"core"})
-                    if host:
-                        host = _decode_ssh_host(host)
-                    parts = folder_uri.split("/", 3)
-                    if len(parts) >= 4:
-                        folder_path = "/" + parts[3]
-                    else:
-                        continue
-                else:
-                    continue
+            location = _parse_workspace_location(data)
+            if not location:
+                continue
+            folder_uri, folder_path, host, ws_type = location
 
             # Get DB modification time
             db_path = ws_dir / "state.vscdb"
@@ -245,13 +221,11 @@ def list_all_workspaces() -> list[dict]:
 
 
 def get_global_composer_headers() -> list[dict]:
-    """Read the central composer.composerHeaders from the global DB.
+    """Read and combine modern and legacy global composer headers.
 
-    Returns the allComposers list from composer.composerHeaders in the
-    global DB's ItemTable. In Cursor 3.0+ this is the authoritative
-    index of all chats, each tagged with a workspaceIdentifier.
-
-    Returns an empty list if not present (pre-3.0 Cursor).
+    The dedicated SQL composerHeaders table is authoritative when present.
+    The older ItemTable JSON index is retained as a fallback source, with
+    composer IDs deduplicated. Subagents are not top-level conversations.
     """
     from . import db
 
@@ -260,9 +234,16 @@ def get_global_composer_headers() -> list[dict]:
         return []
     try:
         with db.CursorDB(global_db) as cdb:
+            result = cdb.get_composer_headers()
+            seen = {entry.get("composerId") for entry in result}
             headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
             if headers and isinstance(headers, dict):
-                return headers.get("allComposers", [])
+                for entry in headers.get("allComposers", []):
+                    cid = entry.get("composerId")
+                    if cid and cid not in seen and not entry.get("isSubagent", False):
+                        result.append(entry)
+                        seen.add(cid)
+            return result
     except Exception:
         pass
     return []

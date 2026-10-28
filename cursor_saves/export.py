@@ -35,7 +35,7 @@ def get_workspace_conversations(
 
     all_conversations = []
     seen_ids: set[str] = set()
-    ids_needing_metadata: list[tuple[str, str]] = []  # (composerId, ws_dir_str)
+    conversations_by_id: dict[str, dict] = {}
     headers_map = paths._build_global_headers_map()
 
     for ws_dir in ws_dirs:
@@ -50,6 +50,7 @@ def get_workspace_conversations(
                 entry_copy = dict(entry)
                 entry_copy["_workspaceDir"] = ws_dir_str
                 all_conversations.append(entry_copy)
+                conversations_by_id[cid] = entry_copy
 
         # Source 2: workspace DB
         db_path = ws_dir / "state.vscdb"
@@ -66,8 +67,10 @@ def get_workspace_conversations(
                 cid = c.get("composerId")
                 if cid and cid not in seen_ids:
                     seen_ids.add(cid)
-                    c["_workspaceDir"] = ws_dir_str
-                    all_conversations.append(c)
+                    entry_copy = dict(c)
+                    entry_copy["_workspaceDir"] = ws_dir_str
+                    all_conversations.append(entry_copy)
+                    conversations_by_id[cid] = entry_copy
 
             # selectedComposerIds + pane entries (need metadata lookup)
             extra_ids: set[str] = set()
@@ -90,25 +93,21 @@ def get_workspace_conversations(
 
             for cid in extra_ids:
                 seen_ids.add(cid)
-                ids_needing_metadata.append((cid, ws_dir_str))
+                entry = {"composerId": cid, "_workspaceDir": ws_dir_str}
+                all_conversations.append(entry)
+                conversations_by_id[cid] = entry
 
-    # Fetch metadata for IDs found only via pane/selection entries
-    if ids_needing_metadata:
+    # Modern SQL headers often omit display metadata such as the chat name.
+    if all_conversations:
         global_db = paths.get_global_db_path()
         if global_db.exists():
             with db.CursorDB(global_db) as cdb:
-                for cid, ws_dir_str in ids_needing_metadata:
+                for cid, entry in conversations_by_id.items():
                     cd = cdb.get_json(f"composerData:{cid}")
                     if cd:
-                        all_conversations.append({
-                            "composerId": cid,
-                            "name": cd.get("name", ""),
-                            "createdAt": cd.get("createdAt", 0),
-                            "lastUpdatedAt": cd.get("lastUpdatedAt", 0),
-                            "unifiedMode": cd.get("unifiedMode", "agent"),
-                            "forceMode": cd.get("forceMode", ""),
-                            "_workspaceDir": ws_dir_str,
-                        })
+                        for key in ("name", "createdAt", "lastUpdatedAt", "unifiedMode", "forceMode"):
+                            if not entry.get(key) and cd.get(key) is not None:
+                                entry[key] = cd[key]
 
     all_conversations.sort(
         key=lambda c: c.get("createdAt", 0), reverse=True
@@ -269,6 +268,7 @@ def list_conversations(
                 "lastUpdated": format_timestamp(c.get("lastUpdatedAt", c.get("createdAt", 0))),
                 "mode": c.get("unifiedMode", c.get("forceMode", "unknown")),
                 "messageCount": msg_count,
+                "archived": bool(c.get("isArchived", False)),
             })
 
     return results
@@ -410,6 +410,7 @@ def export_conversation(
     composer_id: str,
     _cdb: Optional[db.CursorDB] = None,
     source_host: Optional[str] = None,
+    composer_header: Optional[dict] = None,
 ) -> Optional[dict]:
     """Export a single conversation to a self-contained snapshot dict.
 
@@ -420,6 +421,15 @@ def export_conversation(
     Pass source_host for SSH workspaces (e.g. "core-3").
     """
     global_db = paths.get_global_db_path()
+    if composer_header is None:
+        composer_header = next(
+            (
+                header
+                for header in paths.get_global_composer_headers()
+                if header.get("composerId") == composer_id
+            ),
+            None,
+        )
     own_cdb = _cdb is None
     if own_cdb:
         _cdb = db.CursorDB(global_db)
@@ -478,6 +488,7 @@ def export_conversation(
             "projectIdentifier": paths.get_project_identifier(project_path),
             "composerId": composer_id,
             "composerData": conv_data,
+            "composerHeader": composer_header,
             "contentBlobs": blobs,
             "bubbleEntries": bubbles,
             "checkpoints": checkpoints,
@@ -630,7 +641,13 @@ def checkpoint_project(
     with db.CursorDB(global_db) as cdb:
         for i, (c, composer_id) in enumerate(to_process, 1):
             # Export the conversation
-            snapshot = export_conversation(project_path, composer_id, _cdb=cdb, source_host=source_host)
+            snapshot = export_conversation(
+                project_path,
+                composer_id,
+                _cdb=cdb,
+                source_host=source_host,
+                composer_header=c,
+            )
             if snapshot:
                 path = save_snapshot(snapshot, snapshots_dir)
                 saved.append(path)

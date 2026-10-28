@@ -361,15 +361,16 @@ def cmd_list(args):
         return
 
     print(f"Conversations for {project_path}\n")
-    print(f"{'ID':<40} {'Name':<30} {'Mode':<8} {'Msgs':>5}  {'Last Updated'}")
-    print("-" * 110)
+    print(f"{'ID':<40} {'Name':<30} {'Mode':<8} {'State':<8} {'Msgs':>5}  {'Last Updated'}")
+    print("-" * 120)
 
     for c in conversations:
         name = c["name"]
         if len(name) > 28:
             name = name[:25] + "..."
         print(
-            f"{c['id']:<40} {name:<30} {c['mode']:<8} {c['messageCount']:>5}  {c['lastUpdated']}"
+            f"{c['id']:<40} {name:<30} {c['mode']:<8} "
+            f"{'archived' if c['archived'] else 'active':<8} {c['messageCount']:>5}  {c['lastUpdated']}"
         )
 
     print(f"\n{len(conversations)} conversation(s) total")
