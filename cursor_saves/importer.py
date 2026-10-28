@@ -82,7 +82,10 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
         return {
             "composerId": data.get("composerId"),
             "name": cd.get("name"),
-            "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+            "messageCount": max(
+                len(cd.get("fullConversationHeadersOnly", [])),
+                len(data.get("bubbleEntries", {})),
+            ),
             "exportedAt": data.get("exportedAt"),
             "sourceMachine": data.get("sourceMachine"),
             "sourceHost": data.get("sourceHost"),

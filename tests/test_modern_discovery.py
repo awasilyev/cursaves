@@ -119,6 +119,7 @@ class ModernDiscoveryTests(unittest.TestCase):
         return ws_dir
 
     def test_modern_top_level_discovery_deduplicates_legacy_and_excludes_subagents(self) -> None:
+        active_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         ws1 = self.make_workspace(
             "workspace-one",
             {
@@ -130,19 +131,21 @@ class ModernDiscoveryTests(unittest.TestCase):
             },
         )
         ws2 = self.make_workspace("workspace-two", {"folder": "file:///tmp/other"})
-        add_modern_header(self.global_db, "active", ws1.name)
+        add_modern_header(self.global_db, active_id, ws1.name)
         add_modern_header(self.global_db, "archived", ws1.name, archived=True)
         add_modern_header(self.global_db, "subagent", ws1.name, subagent=True)
         add_modern_header(self.global_db, "other", ws2.name)
-        for cid in ("active", "archived", "subagent", "other"):
+        for cid in (active_id, "archived", "subagent", "other"):
             add_composer_data(self.global_db, cid, cid.title())
+        put_json(self.global_db, f"bubbleId:{active_id}:bubble-1", {"text": "first"})
+        put_json(self.global_db, f"bubbleId:{active_id}:bubble-2", {"text": "second"})
 
         put_json(
             self.global_db,
             "composer.composerHeaders",
             {
                 "allComposers": [
-                    {"composerId": "active", "workspaceIdentifier": {"id": ws1.name}},
+                    {"composerId": active_id, "workspaceIdentifier": {"id": ws1.name}},
                     {"composerId": "legacy-only", "workspaceIdentifier": {"id": ws1.name}},
                 ]
             },
@@ -152,14 +155,15 @@ class ModernDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(
             set(paths.get_workspace_composer_ids(ws1 / "state.vscdb")),
-            {"active", "archived", "legacy-only"},
+            {active_id, "archived", "legacy-only"},
         )
         self.assertEqual(paths.get_workspace_composer_ids(ws2 / "state.vscdb"), ["other"])
 
         conversations = export.list_conversations("/unused", workspace_dir=ws1)
         by_id = {item["id"]: item for item in conversations}
-        self.assertEqual(set(by_id), {"active", "archived", "legacy-only"})
-        self.assertFalse(by_id["active"]["archived"])
+        self.assertEqual(set(by_id), {active_id, "archived", "legacy-only"})
+        self.assertFalse(by_id[active_id]["archived"])
+        self.assertEqual(by_id[active_id]["messageCount"], 2)
         self.assertTrue(by_id["archived"]["archived"])
         self.assertEqual(by_id["archived"]["name"], "Archived")
 
