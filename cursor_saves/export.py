@@ -252,6 +252,7 @@ def list_conversations(
 
     # Single DB connection for all lookups
     with db.CursorDB(global_db) as cdb:
+        bubble_counts = cdb.count_keys_by_chat_prefix("bubbleId")
         for c in conversations:
             composer_id = c.get("composerId", "unknown")
 
@@ -259,7 +260,7 @@ def list_conversations(
             conv_data = cdb.get_json(f"composerData:{composer_id}")
             if conv_data:
                 headers = conv_data.get("fullConversationHeadersOnly", [])
-                msg_count = len(headers)
+                msg_count = max(len(headers), bubble_counts.get(composer_id, 0))
 
             results.append({
                 "id": composer_id,
@@ -587,7 +588,10 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
     meta = {
         "composerId": composer_id,
         "name": cd.get("name"),
-        "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+        "messageCount": max(
+            len(cd.get("fullConversationHeadersOnly", [])),
+            len(snapshot.get("bubbleEntries", {})),
+        ),
         "exportedAt": snapshot.get("exportedAt"),
         "sourceMachine": snapshot.get("sourceMachine"),
         "sourceHost": snapshot.get("sourceHost"),
