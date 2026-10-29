@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -86,6 +87,7 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
                 len(cd.get("fullConversationHeadersOnly", [])),
                 len(data.get("bubbleEntries", {})),
             ),
+            "lastUpdatedAt": cd.get("lastUpdatedAt", cd.get("createdAt", 0)),
             "exportedAt": data.get("exportedAt"),
             "sourceMachine": data.get("sourceMachine"),
             "sourceHost": data.get("sourceHost"),
@@ -102,6 +104,43 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
             "sourceMachine": None,
             "sourceProjectPath": None,
         }
+
+
+def filter_snapshot_files(
+    snapshot_files: list[Path],
+    last_days: Optional[int] = None,
+    last_chats: Optional[int] = None,
+    now_ms: Optional[int] = None,
+) -> list[Path]:
+    """Filter snapshots by conversation activity, newest first."""
+    snapshots = []
+    for snapshot_file in snapshot_files:
+        meta = read_snapshot_meta(snapshot_file)
+        updated_at = meta.get("lastUpdatedAt") or 0
+        if not updated_at:
+            exported_at = meta.get("exportedAt")
+            if exported_at:
+                try:
+                    updated_at = int(
+                        datetime.fromisoformat(exported_at.replace("Z", "+00:00"))
+                        .astimezone(timezone.utc)
+                        .timestamp()
+                        * 1000
+                    )
+                except (TypeError, ValueError):
+                    updated_at = 0
+        snapshots.append((updated_at, snapshot_file))
+
+    if last_days is not None:
+        if now_ms is None:
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        cutoff = now_ms - last_days * 24 * 60 * 60 * 1000
+        snapshots = [item for item in snapshots if item[0] >= cutoff]
+
+    snapshots.sort(key=lambda item: item[0], reverse=True)
+    if last_chats is not None:
+        snapshots = snapshots[:last_chats]
+    return [snapshot_file for _, snapshot_file in snapshots]
 
 
 def is_cursor_running() -> bool:
@@ -676,6 +715,8 @@ def import_from_snapshot_dir(
     target_project_path: str,
     force: bool = False,
     target_workspace_dir: Optional[Path] = None,
+    last_days: Optional[int] = None,
+    last_chats: Optional[int] = None,
 ) -> tuple[int, int]:
     """Import all snapshots from a specific snapshot directory.
 
@@ -698,7 +739,11 @@ def import_from_snapshot_dir(
         )
         return 0, 0
 
-    snapshot_files = list_snapshot_files(snapshot_dir)
+    snapshot_files = filter_snapshot_files(
+        list_snapshot_files(snapshot_dir),
+        last_days=last_days,
+        last_chats=last_chats,
+    )
     if not snapshot_files:
         return 0, 0
 
@@ -737,6 +782,8 @@ def import_all_snapshots(
     snapshots_dir: Optional[Path] = None,
     force: bool = False,
     target_workspace_dir: Optional[Path] = None,
+    last_days: Optional[int] = None,
+    last_chats: Optional[int] = None,
 ) -> tuple[int, int]:
     """Import all snapshots for a project.
 
@@ -781,6 +828,7 @@ def import_all_snapshots(
     return import_from_snapshot_dir(
         project_snapshots, target_project_path, force=force,
         target_workspace_dir=target_workspace_dir,
+        last_days=last_days, last_chats=last_chats,
     )
 
 

@@ -15,6 +15,7 @@ from .importer import (
     doctor_audit,
     doctor_recover,
     find_snapshot_dir_for_project,
+    filter_snapshot_files,
     format_sync_status,
     get_push_status_for_conversation,
     get_sync_status_for_snapshot,
@@ -406,7 +407,12 @@ def cmd_checkpoint(args):
     project_path, workspace_dir, _ = _resolve_project_and_workspace(args)
 
     print(f"Checkpointing conversations for {project_path}...")
-    saved = export.checkpoint_project(project_path, workspace_dir=workspace_dir)
+    saved = export.checkpoint_project(
+        project_path,
+        workspace_dir=workspace_dir,
+        last_days=args.last_days,
+        last_chats=args.last_chats,
+    )
 
     if not saved:
         print("No conversations found to checkpoint.")
@@ -592,14 +598,25 @@ def _select_workspace() -> tuple[str, "Path", str | None] | None:
     return ws["path"], ws["workspace_dir"], ws.get("host")
 
 
-def _select_conversations(project_path: str, prompt: str = "push", workspace_dir: "Path | None" = None) -> list[str]:
+def _select_conversations(
+    project_path: str,
+    prompt: str = "push",
+    workspace_dir: "Path | None" = None,
+    last_days: int | None = None,
+    last_chats: int | None = None,
+) -> list[str]:
     """Show conversations for a workspace and let the user pick.
 
     Returns a list of selected composer IDs, or empty list.
     """
     from .interactive import select_conversations as tui_select_conversations
 
-    conversations = export.list_conversations(project_path, workspace_dir=workspace_dir)
+    conversations = export.list_conversations(
+        project_path,
+        workspace_dir=workspace_dir,
+        last_days=last_days,
+        last_chats=last_chats,
+    )
     if not conversations:
         print(f"No conversations found for {project_path}")
         return []
@@ -1002,7 +1019,13 @@ def cmd_push(args):
 
     # Always show conversation list for selection (unless --all flag)
     if not getattr(args, "all_chats", False):
-        composer_ids = _select_conversations(project_path, prompt="push", workspace_dir=workspace_dir)
+        composer_ids = _select_conversations(
+            project_path,
+            prompt="push",
+            workspace_dir=workspace_dir,
+            last_days=args.last_days,
+            last_chats=args.last_chats,
+        )
         if not composer_ids:
             print("No conversations selected.")
             return
@@ -1015,6 +1038,7 @@ def cmd_push(args):
     saved = export.checkpoint_project(
         project_path, composer_ids=composer_ids,
         workspace_dir=workspace_dir, source_host=source_host,
+        last_days=args.last_days, last_chats=args.last_chats,
     )
 
     if not saved:
@@ -1106,7 +1130,11 @@ def cmd_pull(args):
         total_failure = 0
         for project in [selected_project["_project"]]:
             # Build snapshot list for this project
-            snapshot_files = list_snapshot_files(project["path"])
+            snapshot_files = filter_snapshot_files(
+                list_snapshot_files(project["path"]),
+                last_days=args.last_days,
+                last_chats=args.last_chats,
+            )
             snapshots_info = []
             for sf in snapshot_files:
                 meta = read_snapshot_meta(sf)
@@ -1197,6 +1225,8 @@ def cmd_pull(args):
             project_path,
             force=args.force,
             target_workspace_dir=workspace_dir,
+            last_days=args.last_days,
+            last_chats=args.last_chats,
         )
 
         if success == 0 and failure == 0:
@@ -1682,6 +1712,29 @@ def cmd_migrate(args):
         print_reload_hint()
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _add_recency_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--last-days",
+        type=_positive_int,
+        metavar="DAYS",
+        help="Only conversations updated within the last DAYS",
+    )
+    group.add_argument(
+        "--last-chats",
+        type=_positive_int,
+        metavar="COUNT",
+        help="Only the COUNT most recently updated conversations",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="cursaves",
@@ -1757,6 +1810,7 @@ def main():
         "checkpoint", help="Export all conversations for a project"
     )
     add_project_args(p_checkpoint)
+    _add_recency_args(p_checkpoint)
     p_checkpoint.set_defaults(func=cmd_checkpoint)
 
     # ── import ──────────────────────────────────────────────────────
@@ -1791,6 +1845,7 @@ def main():
         "--ahead", "-a", action="store_true",
         help="Find and push all conversations ahead of snapshots across all workspaces",
     )
+    _add_recency_args(p_push)
     p_push.set_defaults(func=cmd_push)
 
     # ── pull ────────────────────────────────────────────────────────
@@ -1814,6 +1869,7 @@ def main():
         "--reload", action="store_true",
         help="(deprecated, no effect) Cursor requires a full restart to see imports",
     )
+    _add_recency_args(p_pull)
     p_pull.set_defaults(func=cmd_pull)
 
     # ── sync ──────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+import argparse
 import gzip
 import json
 import sqlite3
@@ -272,6 +273,80 @@ class ConversationSelectionTests(unittest.TestCase):
 
         self.assertEqual(result, ["new", "old"])
         self.assertEqual(select.call_args.args[0], conversations)
+
+
+class ConversationFilterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        day = 24 * 60 * 60 * 1000
+        self.now = 10 * day
+        self.conversations = [
+            {"composerId": "new", "createdAt": self.now - day, "isArchived": False},
+            {"composerId": "archived", "lastUpdatedAt": self.now - 2 * day, "isArchived": True},
+            {"composerId": "old", "lastUpdatedAt": self.now - 8 * day, "isArchived": False},
+        ]
+
+    def test_last_days_uses_updated_at_and_includes_archived(self) -> None:
+        result = export.filter_conversations(
+            self.conversations, last_days=3, now_ms=self.now
+        )
+        self.assertEqual([c["composerId"] for c in result], ["new", "archived"])
+
+    def test_last_chats_returns_most_recent(self) -> None:
+        result = export.filter_conversations(self.conversations, last_chats=2)
+        self.assertEqual([c["composerId"] for c in result], ["new", "archived"])
+
+    def test_cli_recency_options_are_positive_and_mutually_exclusive(self) -> None:
+        parser = argparse.ArgumentParser()
+        cli._add_recency_args(parser)
+        self.assertEqual(parser.parse_args(["--last-days", "7"]).last_days, 7)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--last-chats", "0"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--last-days", "7", "--last-chats", "10"])
+
+
+class SnapshotFilterTests(unittest.TestCase):
+    def test_filters_by_conversation_update_time(self) -> None:
+        day = 24 * 60 * 60 * 1000
+        now = 10 * day
+        files = [Path("old.json.gz"), Path("new.json.gz"), Path("middle.json.gz")]
+        metadata = {
+            "old.json.gz": {"lastUpdatedAt": now - 8 * day},
+            "new.json.gz": {"lastUpdatedAt": now - day},
+            "middle.json.gz": {"lastUpdatedAt": now - 2 * day},
+        }
+        with patch.object(
+            importer,
+            "read_snapshot_meta",
+            side_effect=lambda path: metadata[path.name],
+        ):
+            recent = importer.filter_snapshot_files(files, last_days=3, now_ms=now)
+            latest = importer.filter_snapshot_files(files, last_chats=2)
+
+        self.assertEqual([path.name for path in recent], ["new.json.gz", "middle.json.gz"])
+        self.assertEqual([path.name for path in latest], ["new.json.gz", "middle.json.gz"])
+
+    def test_falls_back_to_exported_at_for_old_snapshots(self) -> None:
+        files = [Path("snapshot.json.gz")]
+        with patch.object(
+            importer,
+            "read_snapshot_meta",
+            return_value={"exportedAt": "1970-01-10T00:00:00+00:00"},
+        ):
+            result = importer.filter_snapshot_files(
+                files,
+                last_days=2,
+                now_ms=10 * 24 * 60 * 60 * 1000,
+            )
+        self.assertEqual(result, files)
+
+    def test_sync_pull_behind_does_not_require_pull_arguments(self) -> None:
+        project = {"path": Path("/tmp/cursaves/snapshots/project")}
+        with (
+            patch.object(cli, "list_snapshot_projects", return_value=[project]),
+            patch.object(cli, "list_snapshot_files", return_value=[]),
+        ):
+            self.assertEqual(cli._pull_behind(Path("/tmp/cursaves")), 0)
 
 
 if __name__ == "__main__":

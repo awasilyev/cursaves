@@ -115,6 +115,38 @@ def get_workspace_conversations(
     return all_conversations
 
 
+def filter_conversations(
+    conversations: list[dict],
+    last_days: Optional[int] = None,
+    last_chats: Optional[int] = None,
+    now_ms: Optional[int] = None,
+) -> list[dict]:
+    """Filter conversations by update age or most-recent count."""
+    if last_days is not None:
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        cutoff = now_ms - last_days * 24 * 60 * 60 * 1000
+        conversations = [
+            conversation
+            for conversation in conversations
+            if (conversation.get("lastUpdatedAt") or conversation.get("createdAt") or 0)
+            >= cutoff
+        ]
+
+    conversations = sorted(
+        conversations,
+        key=lambda conversation: (
+            conversation.get("lastUpdatedAt")
+            or conversation.get("createdAt")
+            or 0
+        ),
+        reverse=True,
+    )
+    if last_chats is not None:
+        conversations = conversations[:last_chats]
+    return conversations
+
+
 def get_conversation_data(composer_id: str) -> Optional[dict]:
     """Fetch the full conversation data from the global DB."""
     global_db = paths.get_global_db_path()
@@ -238,12 +270,19 @@ def format_timestamp(ts_ms: int) -> str:
 def list_conversations(
     project_path: str,
     workspace_dir: Optional[Path] = None,
+    last_days: Optional[int] = None,
+    last_chats: Optional[int] = None,
 ) -> list[dict]:
     """List all conversations for a project with display-friendly info.
 
     Returns list of dicts with: id, name, date, mode, messageCount.
     """
     conversations = get_workspace_conversations(project_path, workspace_dir=workspace_dir)
+    conversations = filter_conversations(
+        conversations,
+        last_days=last_days,
+        last_chats=last_chats,
+    )
     if not conversations:
         return []
 
@@ -592,6 +631,7 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
             len(cd.get("fullConversationHeadersOnly", [])),
             len(snapshot.get("bubbleEntries", {})),
         ),
+        "lastUpdatedAt": cd.get("lastUpdatedAt", cd.get("createdAt", 0)),
         "exportedAt": snapshot.get("exportedAt"),
         "sourceMachine": snapshot.get("sourceMachine"),
         "sourceHost": snapshot.get("sourceHost"),
@@ -611,6 +651,8 @@ def checkpoint_project(
     composer_ids: Optional[list[str]] = None,
     workspace_dir: Optional[Path] = None,
     source_host: Optional[str] = None,
+    last_days: Optional[int] = None,
+    last_chats: Optional[int] = None,
 ) -> list[Path]:
     """Export conversations for a project to snapshots/.
 
@@ -625,6 +667,11 @@ def checkpoint_project(
     t0 = time.time()
     print("  Fetching workspace conversations...", file=sys.stderr, flush=True)
     conversations = get_workspace_conversations(project_path, workspace_dir=workspace_dir)
+    conversations = filter_conversations(
+        conversations,
+        last_days=last_days,
+        last_chats=last_chats,
+    )
     print(f"  Found {len(conversations)} conversation(s) in workspace(s)", file=sys.stderr, flush=True)
 
     # Filter to selected ids and count how many we'll actually process

@@ -187,7 +187,11 @@ cursaves sync
 
 # Or manually:
 cursaves push              # checkpoint + push
+cursaves push --all --last-days 30   # chats updated in the last 30 days
+cursaves push --all --last-chats 100 # 100 most recently updated chats
 cursaves pull              # pull + import into Cursor's database
+cursaves pull --last-days 30         # import chats updated in the last 30 days
+cursaves pull --last-chats 100       # import 100 most recently updated chats
 # Then restart Cursor to see the imported conversations
 ```
 
