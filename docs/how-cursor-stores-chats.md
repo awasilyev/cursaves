@@ -219,7 +219,7 @@ As of v0.8.2, cursaves combines multiple sources for maximum coverage:
 
 **Deletion (purge):**
 
-`cursaves purge` lists all chats with their key counts (a proxy for size), grouped by workspace. You can select individual chats by number, ranges, or all chats from a workspace. Deletion removes:
+`cursaves purge` lists all chats with their key counts (a proxy for size), grouped by workspace. You can select chats interactively, or use `cursaves purge --older-than DAYS` to delete every chat whose `lastUpdatedAt` (or `createdAt` fallback) is older than the cutoff. Chats with no known activity date are retained. Add `--yes` to skip confirmation. Deletion removes:
 - `composerData:{id}` — the chat metadata and conversation map
 - `bubbleId:{id}:*` — all message bubble entries (typically the bulk of storage)
 - `checkpointId:{id}:*` — agent checkpoint data
@@ -227,6 +227,8 @@ As of v0.8.2, cursaves combines multiple sources for maximum coverage:
 - The chat's entry in `allComposers` / `selectedComposerIds` (workspace DB)
 
 After purging, run `sqlite3 '<global-db-path>' 'VACUUM;'` to actually reclaim the freed disk space. Cursor must be fully closed before purging.
+
+To remove an entire workspace, use `cursaves workspaces --delete [selector]`. This purges all chats assigned to that workspace and removes its `workspaceStorage/{id}` directory, while preserving source project files and cursaves snapshots. A recovery copy of the workspace directory is created under `~/.config/cursaves/backups/workspaces/` first.
 
 ## Conversation Data Structure
 

@@ -298,6 +298,28 @@ class CursorDB:
         )
         conn.commit()
 
+    def delete_composer_headers(self, composer_ids: list[str]) -> int:
+        """Delete modern composer header rows for the given conversations."""
+        if not composer_ids or not self.table_exists("composerHeaders"):
+            return 0
+        conn = self._get_write_conn()
+        total = 0
+        conn.execute("BEGIN")
+        try:
+            for batch_start in range(0, len(composer_ids), 500):
+                batch = composer_ids[batch_start:batch_start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                cur = conn.execute(
+                    f"DELETE FROM composerHeaders WHERE composerId IN ({placeholders})",
+                    batch,
+                )
+                total += cur.rowcount
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return total
+
     def delete_keys(self, keys: list[str], table: str = "cursorDiskKV") -> int:
         """Delete multiple keys in a single transaction on the ORIGINAL database.
 

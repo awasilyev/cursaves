@@ -359,7 +359,7 @@ def list_workspaces_with_conversations() -> list[dict]:
     return result
 
 
-def resolve_workspace(selector: str) -> Optional[dict]:
+def resolve_workspace(selector: str, include_empty: bool = False) -> Optional[dict]:
     """Resolve a workspace selector to a workspace dict.
 
     The selector can be:
@@ -367,16 +367,19 @@ def resolve_workspace(selector: str) -> Optional[dict]:
       - A workspace hash (directory name under workspaceStorage/)
       - A path substring (matched against workspace paths)
     """
-    workspaces = list_workspaces_with_conversations()
-
     # Try as index
     try:
         idx = int(selector)
+        # Numeric selectors always refer to the numbered `workspaces` output,
+        # which intentionally lists only workspaces with conversations.
+        workspaces = list_workspaces_with_conversations()
         if workspaces and 1 <= idx <= len(workspaces):
             return workspaces[idx - 1]
         return None
     except ValueError:
         pass
+
+    workspaces = list_all_workspaces() if include_empty else list_workspaces_with_conversations()
 
     # Try as workspace hash (exact match, or prefix match when selector is 8 chars (short hash))
     # Allow the short hash because that's what's displayed in the workspaces list,

@@ -208,7 +208,7 @@ All commands default to the current working directory as the project path. Use `
 | **`push -s`**  | **Interactively select which conversations to push**       | No                    |
 | **`pull`**     | **Pull from remote + import snapshots**                    | Yes                   |
 | `init`         | Initialize sync (git remote, S3 bucket, etc.)              | No                    |
-| `workspaces`   | List all Cursor workspaces (local, SSH, custom) with hash  | No                    |
+| `workspaces`   | List all Cursor workspaces (local, SSH, custom) with hash  | With `--delete`       |
 | `list`         | Show conversations for a project                           | No                    |
 | `snapshots`    | List snapshot projects available in ~/.cursaves/           | No                    |
 | `status`       | Compare local conversations vs snapshots                   | No                    |
@@ -224,6 +224,17 @@ All commands default to the current working directory as the project path. Use `
 | `purge`        | Delete chats from Cursor's DB to reclaim disk space          | Yes                   |
 
 Most of the time you only need `sync`. Use `push -s` when you want to push specific conversations. Use `repair` if you get "Blob not found" errors after importing. Use `doctor` to find and recover orphaned chats. Use `migrate` after updating to Cursor 3.0 to make all old chats visible in the sidebar. Use `purge` to delete chats and reclaim disk space (requires Cursor to be closed). Use `delete` to clean up snapshots you no longer need.
+
+To delete every chat last updated more than a given number of days ago, quit Cursor and run:
+
+```bash
+cursaves purge --older-than 30
+cursaves purge --older-than 30 --yes  # skip confirmation
+```
+
+Chats without a known update or creation date are retained. Add `-w <name>` to limit the purge to a workspace. Synced snapshots are not deleted.
+
+To completely remove a Cursor workspace and its local chats, quit Cursor and run `cursaves workspaces --delete`. You can also pass a workspace number, hash, or path substring, for example `cursaves workspaces --delete 497e8ab0`. Source project files and synced snapshots are preserved, and a recovery copy of the workspace database is stored under `~/.config/cursaves/backups/workspaces/`.
 
 ### Auto-sync with `watch`
 
@@ -284,7 +295,7 @@ Note: "Developer: Reload Window" is not sufficient -- it reloads the renderer bu
 ## Safety
 
 - **Read operations** (`list`, `export`, `checkpoint`, `status`, `watch`) work on a temporary copy of the database. They never touch Cursor's files and are safe to run while Cursor is open.
-- **Write operations** (`import`, `pull`) back up the target database before writing, and refuse to run while Cursor is detected as running. Use `--force` to override (not recommended).
+- **Write operations** (`import`, `pull`, `purge`, `workspaces --delete`) back up affected databases before writing, and refuse to run while Cursor is detected as running. Use `--force` to override (not recommended).
 - Snapshots are self-contained JSON -- even if import goes wrong, you always have the raw data and the backup.
 
 ## Privacy Warning

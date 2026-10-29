@@ -3,6 +3,7 @@
 import gzip
 import json
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -117,6 +118,16 @@ def filter_snapshot_files(
     for snapshot_file in snapshot_files:
         meta = read_snapshot_meta(snapshot_file)
         updated_at = meta.get("lastUpdatedAt") or 0
+        if not updated_at:
+            try:
+                composer_data = read_snapshot_file(snapshot_file).get("composerData", {})
+                updated_at = (
+                    composer_data.get("lastUpdatedAt")
+                    or composer_data.get("createdAt")
+                    or 0
+                )
+            except Exception:
+                updated_at = 0
         if not updated_at:
             exported_at = meta.get("exportedAt")
             if exported_at:
@@ -1058,6 +1069,19 @@ def copy_between_workspaces(
     read_cdb = db.CursorDB(global_db_path)
     write_cdb = db.CursorDB(global_db_path)
     try:
+        source_headers = {
+            header.get("composerId"): header
+            for header in paths.get_global_composer_headers()
+            if header.get("composerId")
+        }
+        with db.CursorDB(source_ws_dir / "state.vscdb") as source_ws_cdb:
+            legacy_data = source_ws_cdb.get_json("composer.composerData", table="ItemTable")
+        if isinstance(legacy_data, dict):
+            for header in legacy_data.get("allComposers", []):
+                composer_id = header.get("composerId")
+                if composer_id:
+                    source_headers.setdefault(composer_id, header)
+
         for old_id in composer_ids:
             composer_data = read_cdb.get_json(f"composerData:{old_id}")
             if not composer_data:
@@ -1123,7 +1147,12 @@ def copy_between_workspaces(
                     write_cdb.write_json_batch(cp_items)
 
             # Register in target workspace
-            if _register_in_workspace(new_id, new_data, target_ws_dir):
+            if _register_in_workspace(
+                new_id,
+                new_data,
+                target_ws_dir,
+                composer_header=source_headers.get(old_id),
+            ):
                 if needs_rewrite:
                     print(f"  Copied: {name} (paths rewritten)")
                 else:
@@ -1699,7 +1728,8 @@ def list_all_chats_with_sizes() -> list[dict]:
     """List every chat in Cursor's global DB with approximate size info.
 
     Returns a list of dicts with:
-      composerId, name, messageCount, keyCount, workspace_label, workspace_dir
+      composerId, name, messageCount, keyCount, lastUpdatedAt, createdAt,
+      workspace_label, workspace_dir
     Sorted by keyCount descending (largest first).
     """
     global_db_path = paths.get_global_db_path()
@@ -1781,12 +1811,35 @@ def list_all_chats_with_sizes() -> list[dict]:
                 "keyCount": key_count,
                 "bubbleCount": bubble_count,
                 "checkpointCount": checkpoint_count,
+                "lastUpdatedAt": cd.get("lastUpdatedAt", 0),
+                "createdAt": cd.get("createdAt", 0),
                 "workspace_label": cid_to_ws.get(cid, "unknown"),
                 "workspace_dir": cid_to_ws_dir.get(cid, ""),
             })
 
     results.sort(key=lambda x: x["keyCount"], reverse=True)
     return results
+
+
+def filter_chats_older_than(
+    chats: list[dict],
+    days: int,
+    now_ms: Optional[int] = None,
+) -> list[dict]:
+    """Return chats whose latest known activity is strictly older than DAYS."""
+    if now_ms is None:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    cutoff = now_ms - days * 24 * 60 * 60 * 1000
+    old_chats = []
+    for chat in chats:
+        timestamp = chat.get("lastUpdatedAt") or chat.get("createdAt")
+        try:
+            timestamp = float(timestamp)
+        except (TypeError, ValueError):
+            continue
+        if timestamp > 0 and timestamp < cutoff:
+            old_chats.append(chat)
+    return old_chats
 
 
 def purge_chats(
@@ -1850,6 +1903,9 @@ def purge_chats(
                 write_cdb.write_json(
                     "composer.composerHeaders", headers, table="ItemTable"
                 )
+
+        # Cursor 3.0+ stores the authoritative index in a dedicated SQL table.
+        write_cdb.delete_composer_headers(composer_ids)
     finally:
         write_cdb.close()
 
@@ -1887,6 +1943,7 @@ def purge_chats(
                             changed = True
 
                 if changed:
+                    db.backup_db(ws_db_path)
                     ws_cdb.write_json(
                         "composer.composerData", data, table="ItemTable"
                     )
@@ -1896,3 +1953,56 @@ def purge_chats(
             continue
 
     return len(composer_ids), total_keys
+
+
+def delete_workspace(
+    workspace_dir: Path,
+    force: bool = False,
+) -> Optional[tuple[int, int, Path]]:
+    """Delete a Cursor workspace and all conversations owned by it.
+
+    Synced snapshots and source project files are intentionally untouched.
+    Returns (deleted_chats, deleted_keys, workspace_backup_dir), or None when
+    deletion is refused because Cursor is running.
+    """
+    workspace_dir = workspace_dir.resolve()
+    storage_dir = paths.get_workspace_storage_dir().resolve()
+    if workspace_dir.parent != storage_dir or not workspace_dir.is_dir():
+        raise ValueError(f"Not a Cursor workspace directory: {workspace_dir}")
+
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command again.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return None
+
+    workspace_db = workspace_dir / "state.vscdb"
+    composer_ids = (
+        paths.get_workspace_composer_ids(workspace_db)
+        if workspace_db.exists()
+        else []
+    )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_dir = (
+        Path.home()
+        / ".config"
+        / "cursaves"
+        / "backups"
+        / "workspaces"
+        / f"{workspace_dir.name}_{timestamp}"
+    )
+    backup_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(workspace_dir, backup_dir)
+
+    deleted_chats = 0
+    deleted_keys = 0
+    if composer_ids:
+        deleted_chats, deleted_keys = purge_chats(composer_ids, force=True)
+
+    shutil.rmtree(workspace_dir)
+    paths.invalidate_headers_cache()
+    return deleted_chats, deleted_keys, backup_dir

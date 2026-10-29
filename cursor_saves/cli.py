@@ -164,6 +164,11 @@ def _workspace_sync_summary(ws: dict, _global_cdb: "Optional[db.CursorDB]" = Non
 
 def cmd_workspaces(args):
     """List Cursor workspaces that have conversations."""
+    delete_selector = getattr(args, "delete", None)
+    if delete_selector is not None:
+        _delete_workspace(args, delete_selector)
+        return
+
     workspaces = paths.list_workspaces_with_conversations()
     if not workspaces:
         print("No workspaces with conversations found.")
@@ -191,6 +196,76 @@ def cmd_workspaces(args):
 
     print(f"\n{len(workspaces)} workspace(s) with conversations")
     print("\nUse 'cursaves push -w <number or hash>' to push a specific workspace.")
+
+
+def _delete_workspace(args, selector: str) -> None:
+    """Select, confirm, and completely remove one Cursor workspace."""
+    from .importer import delete_workspace
+    from .interactive import confirm as tui_confirm, select_workspace
+
+    if selector:
+        all_workspaces = paths.list_all_workspaces()
+        hash_matches = [
+            ws for ws in all_workspaces
+            if ws["workspace_dir"].name == selector
+            or (len(selector) == 8 and ws["workspace_dir"].name.startswith(selector))
+        ]
+        path_matches = [ws for ws in all_workspaces if selector in ws["path"]]
+        if not selector.isdigit() and not hash_matches and len(path_matches) > 1:
+            print(
+                f"Error: '{selector}' matches multiple workspaces. Use the workspace hash.",
+                file=sys.stderr,
+            )
+            return
+        workspace = paths.resolve_workspace(selector, include_empty=True)
+        if workspace is None:
+            print(
+                f"Error: No workspace matching '{selector}'.",
+                file=sys.stderr,
+            )
+            return
+    else:
+        workspaces = paths.list_all_workspaces()
+        for workspace_item in workspaces:
+            workspace_db = workspace_item["workspace_dir"] / "state.vscdb"
+            workspace_item["conversations"] = len(
+                paths.get_workspace_composer_ids(workspace_db)
+            ) if workspace_db.exists() else 0
+        workspace = select_workspace(workspaces)
+        if workspace is None:
+            return
+
+    workspace_db = workspace["workspace_dir"] / "state.vscdb"
+    chat_count = (
+        len(paths.get_workspace_composer_ids(workspace_db))
+        if workspace_db.exists()
+        else 0
+    )
+    display = paths.format_workspace_display(workspace)
+    print(f"\n  Workspace: {display}")
+    print(f"  Hash:      {workspace['workspace_dir'].name}")
+    print(f"  Chats:     {chat_count}")
+    print("\n  This deletes the Cursor workspace and its local chats.")
+    print("  Source project files and cursaves snapshots are not deleted.")
+
+    if not getattr(args, "yes", False) and not tui_confirm(
+        f"Delete this workspace and {chat_count} chat(s)?"
+    ):
+        print("  Cancelled.")
+        return
+
+    result = delete_workspace(
+        workspace["workspace_dir"],
+        force=getattr(args, "force", False),
+    )
+    if result is None:
+        return
+    deleted_chats, deleted_keys, backup_dir = result
+    print(
+        f"\n  Deleted workspace and {deleted_chats} chat(s) "
+        f"({deleted_keys:,} DB keys)."
+    )
+    print(f"  Recovery backup: {backup_dir}")
 
 
 def _is_remote_path(path: str, source_machine: str) -> bool:
@@ -1632,11 +1707,16 @@ def cmd_doctor(args):
 
 def cmd_purge(args):
     """Delete chats from Cursor's database to reclaim space."""
-    from .importer import list_all_chats_with_sizes, purge_chats
+    from .importer import (
+        filter_chats_older_than,
+        list_all_chats_with_sizes,
+        purge_chats,
+    )
     from .interactive import select_purge_chats, confirm as tui_confirm
 
     force = getattr(args, "force", False)
     ws_filter = getattr(args, "workspace", None)
+    older_than = getattr(args, "older_than", None)
 
     print("\n  Scanning chats (this may take a moment)...\n")
     all_chats = list_all_chats_with_sizes()
@@ -1655,6 +1735,12 @@ def cmd_purge(args):
             print(f"  No chats matching workspace '{ws_filter}'.")
             return
 
+    if older_than is not None:
+        all_chats = filter_chats_older_than(all_chats, older_than)
+        if not all_chats:
+            print(f"  No chats older than {older_than} day(s).")
+            return
+
     with_content = [c for c in all_chats if c["messageCount"] > 0 or c["name"]]
     stubs = [c for c in all_chats if c["messageCount"] == 0 and not c["name"]]
     total_keys = sum(c["keyCount"] for c in all_chats)
@@ -1664,8 +1750,10 @@ def cmd_purge(args):
         f"  {len(with_content)} with content, {len(stubs)} empty stubs\n"
     )
 
-    # Use interactive TUI for selection
-    selected_ids = select_purge_chats(with_content + stubs)
+    if older_than is not None:
+        selected_ids = [c["composerId"] for c in all_chats]
+    else:
+        selected_ids = select_purge_chats(with_content + stubs)
 
     if not selected_ids:
         print("  Nothing selected.")
@@ -1679,7 +1767,7 @@ def cmd_purge(args):
         f"({selected_keys:,} DB keys)."
     )
 
-    if not tui_confirm("Continue with deletion?"):
+    if not getattr(args, "yes", False) and not tui_confirm("Continue with deletion?"):
         print("  Cancelled.")
         return
 
@@ -1784,6 +1872,18 @@ def main():
     # ── workspaces ─────────────────────────────────────────────────
     p_workspaces = subparsers.add_parser(
         "workspaces", help="List all Cursor workspaces (local and SSH remote)"
+    )
+    p_workspaces.add_argument(
+        "--delete", nargs="?", const="", metavar="SELECTOR",
+        help="Delete a workspace by number, hash, or path; omit SELECTOR to choose interactively",
+    )
+    p_workspaces.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the deletion confirmation prompt",
+    )
+    p_workspaces.add_argument(
+        "--force", action="store_true",
+        help="Delete even if Cursor appears to be running",
     )
     p_workspaces.set_defaults(func=cmd_workspaces)
 
@@ -1981,6 +2081,17 @@ def main():
         help="Filter to chats from a specific workspace (name substring)",
     )
     p_purge.add_argument(
+        "--older-than", "--older-than-days",
+        dest="older_than",
+        type=_positive_int,
+        metavar="DAYS",
+        help="Delete all chats last updated more than DAYS ago",
+    )
+    p_purge.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the deletion confirmation prompt",
+    )
+    p_purge.add_argument(
         "--force", action="store_true",
         help="Skip the Cursor-running check",
     )
@@ -2009,6 +2120,7 @@ def main():
             "─── Info & management ──────────────────────────────────────────\n"
             "\n"
             "  workspaces            List Cursor workspaces (local + SSH)\n"
+            "  workspaces --delete   Select and completely delete a workspace\n"
             "  list                  List chats for this project\n"
             "  snapshots             List saved snapshots in ~/.cursaves/\n"
             "  status                Show synced vs local-only chats\n"
@@ -2017,6 +2129,7 @@ def main():
             "  migrate               Migrate old chats to Cursor 3.0 index\n"
             "  migrate --dry-run     Preview migration without writing\n"
             "  purge                 Delete chats from Cursor DB to free space\n"
+            "  purge --older-than 30 Delete all chats older than 30 days\n"
             "  purge -w <name>       Filter purge to a specific workspace\n"
             "  delete -s             Select which snapshots to delete\n"
             "  delete --all-projects Delete ALL snapshots\n"

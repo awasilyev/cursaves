@@ -222,6 +222,32 @@ class ModernDiscoveryTests(unittest.TestCase):
             )
             self.assertIsNotNone(cdb.get_json("checkpointId:archived:checkpoint-1"))
 
+    def test_copy_preserves_archived_header(self) -> None:
+        source_ws = self.make_workspace("source", {"folder": "file:///source/project"})
+        target_ws = self.make_workspace("target", {"folder": "file:///target/project"})
+        add_modern_header(self.global_db, "archived", source_ws.name, archived=True)
+        add_composer_data(self.global_db, "archived", "Archived chat")
+
+        success, failure = importer.copy_between_workspaces(
+            ["archived"],
+            source_ws,
+            target_ws,
+            source_path="/source/project",
+            target_path="/target/project",
+            force=True,
+        )
+
+        self.assertEqual((success, failure), (1, 0))
+        with db.CursorDB(self.global_db) as cdb:
+            copied = [
+                header
+                for header in cdb.get_composer_headers()
+                if header["workspaceIdentifier"]["id"] == target_ws.name
+            ]
+        self.assertEqual(len(copied), 1)
+        self.assertNotEqual(copied[0]["composerId"], "archived")
+        self.assertTrue(copied[0]["isArchived"])
+
 
 class LegacyDiscoveryTests(unittest.TestCase):
     def test_database_without_modern_table_keeps_legacy_discovery(self) -> None:
@@ -254,6 +280,102 @@ class LegacyDiscoveryTests(unittest.TestCase):
                 )
                 self.assertEqual([item["composerId"] for item in conversations], ["legacy"])
                 paths.invalidate_headers_cache()
+
+
+class WorkspaceDeletionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.global_db = self.root / "globalStorage" / "state.vscdb"
+        self.workspace_storage = self.root / "workspaceStorage"
+        create_db(self.global_db, modern=True)
+        paths.invalidate_headers_cache()
+
+        self.patches = [
+            patch.object(paths, "get_global_db_path", return_value=self.global_db),
+            patch.object(paths, "get_workspace_storage_dir", return_value=self.workspace_storage),
+            patch.dict("os.environ", {"HOME": str(self.root)}),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self) -> None:
+        for item in reversed(self.patches):
+            item.stop()
+        paths.invalidate_headers_cache()
+        self.temp.cleanup()
+
+    def make_workspace(self, workspace_id: str, project_path: str) -> Path:
+        ws_dir = self.workspace_storage / workspace_id
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "workspace.json").write_text(
+            json.dumps({"folder": f"file://{project_path}"})
+        )
+        create_db(ws_dir / "state.vscdb")
+        return ws_dir
+
+    def test_delete_workspace_removes_owned_chats_and_preserves_other_workspace(self) -> None:
+        target = self.make_workspace("target-workspace", "/projects/target")
+        other = self.make_workspace("other-workspace", "/projects/other")
+        add_modern_header(self.global_db, "target-chat", target.name)
+        add_modern_header(self.global_db, "other-chat", other.name)
+        add_composer_data(self.global_db, "target-chat", "Delete me")
+        add_composer_data(self.global_db, "other-chat", "Keep me")
+        put_json(self.global_db, "bubbleId:target-chat:bubble-1", {"text": "gone"})
+        put_json(
+            self.global_db,
+            "composer.composerHeaders",
+            {
+                "allComposers": [
+                    {"composerId": "target-chat", "workspaceIdentifier": {"id": target.name}},
+                    {"composerId": "other-chat", "workspaceIdentifier": {"id": other.name}},
+                ]
+            },
+            table="ItemTable",
+        )
+
+        result = importer.delete_workspace(target, force=True)
+
+        self.assertIsNotNone(result)
+        deleted, keys_removed, backup_dir = result
+        self.assertEqual(deleted, 1)
+        self.assertEqual(keys_removed, 2)
+        self.assertFalse(target.exists())
+        self.assertTrue((backup_dir / "workspace.json").exists())
+        self.assertTrue((backup_dir / "state.vscdb").exists())
+        self.assertTrue(other.exists())
+
+        with db.CursorDB(self.global_db) as cdb:
+            self.assertIsNone(cdb.get_json("composerData:target-chat"))
+            self.assertIsNone(cdb.get_json("bubbleId:target-chat:bubble-1"))
+            self.assertIsNotNone(cdb.get_json("composerData:other-chat"))
+            self.assertEqual(
+                [header["composerId"] for header in cdb.get_composer_headers()],
+                ["other-chat"],
+            )
+            legacy_headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
+            self.assertEqual(
+                [header["composerId"] for header in legacy_headers["allComposers"]],
+                ["other-chat"],
+            )
+
+    def test_resolve_workspace_can_include_empty_workspace_for_deletion(self) -> None:
+        empty = self.make_workspace("empty-workspace", "/projects/empty")
+
+        self.assertIsNone(paths.resolve_workspace(empty.name))
+        resolved = paths.resolve_workspace(empty.name, include_empty=True)
+        self.assertEqual(resolved["workspace_dir"], empty)
+
+    def test_numeric_selector_still_matches_numbered_nonempty_list(self) -> None:
+        empty = self.make_workspace("empty-workspace", "/projects/empty")
+        populated = self.make_workspace("populated-workspace", "/projects/populated")
+        add_modern_header(self.global_db, "chat", populated.name)
+        paths.invalidate_headers_cache()
+
+        resolved = paths.resolve_workspace("1", include_empty=True)
+
+        self.assertNotEqual(resolved["workspace_dir"], empty)
+        self.assertEqual(resolved["workspace_dir"], populated)
 
 
 class ConversationSelectionTests(unittest.TestCase):
@@ -304,6 +426,67 @@ class ConversationFilterTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["--last-days", "7", "--last-chats", "10"])
 
+    def test_purge_age_filter_uses_updated_at_then_created_at(self) -> None:
+        day = 24 * 60 * 60 * 1000
+        chats = [
+            {"composerId": "old", "lastUpdatedAt": 2 * day},
+            {"composerId": "created-old", "createdAt": 3 * day},
+            {"composerId": "cutoff", "lastUpdatedAt": 7 * day},
+            {"composerId": "recent", "lastUpdatedAt": 9 * day},
+            {"composerId": "unknown"},
+            {"composerId": "invalid", "lastUpdatedAt": "unknown"},
+        ]
+
+        result = importer.filter_chats_older_than(chats, days=3, now_ms=10 * day)
+
+        self.assertEqual(
+            [chat["composerId"] for chat in result],
+            ["old", "created-old"],
+        )
+
+    def test_purge_older_than_deletes_all_matches_without_selector(self) -> None:
+        day = 24 * 60 * 60 * 1000
+        chats = [
+            {
+                "composerId": "old",
+                "name": "Old",
+                "messageCount": 1,
+                "keyCount": 2,
+                "lastUpdatedAt": day,
+                "workspace_label": "project",
+            },
+            {
+                "composerId": "recent",
+                "name": "Recent",
+                "messageCount": 1,
+                "keyCount": 2,
+                "lastUpdatedAt": 10 * day,
+                "workspace_label": "project",
+            },
+        ]
+        args = argparse.Namespace(
+            force=True,
+            workspace=None,
+            older_than=3,
+            yes=True,
+        )
+        with (
+            patch.object(importer, "list_all_chats_with_sizes", return_value=chats),
+            patch.object(
+                importer,
+                "filter_chats_older_than",
+                return_value=[chats[0]],
+            ),
+            patch.object(importer, "purge_chats", return_value=(1, 2)) as purge,
+            patch("cursor_saves.interactive.select_purge_chats") as select,
+            patch("cursor_saves.interactive.confirm") as confirm,
+        ):
+            cli.cmd_purge(args)
+
+        purge.assert_called_once_with(["old"], force=True)
+        select.assert_not_called()
+        confirm.assert_not_called()
+
 
 class SnapshotFilterTests(unittest.TestCase):
     def test_filters_by_conversation_update_time(self) -> None:
@@ -325,6 +508,32 @@ class SnapshotFilterTests(unittest.TestCase):
 
         self.assertEqual([path.name for path in recent], ["new.json.gz", "middle.json.gz"])
         self.assertEqual([path.name for path in latest], ["new.json.gz", "middle.json.gz"])
+
+    def test_old_sidecars_use_snapshot_activity_before_export_time(self) -> None:
+        files = [Path("old.json.gz"), Path("new.json.gz")]
+        metadata = {
+            "old.json.gz": {"exportedAt": "1970-01-03T00:00:00+00:00"},
+            "new.json.gz": {"exportedAt": "1970-01-02T00:00:00+00:00"},
+        }
+        snapshots = {
+            "old.json.gz": {"composerData": {"lastUpdatedAt": 100}},
+            "new.json.gz": {"composerData": {"lastUpdatedAt": 200}},
+        }
+        with (
+            patch.object(
+                importer,
+                "read_snapshot_meta",
+                side_effect=lambda path: metadata[path.name],
+            ),
+            patch.object(
+                importer,
+                "read_snapshot_file",
+                side_effect=lambda path: snapshots[path.name],
+            ),
+        ):
+            latest = importer.filter_snapshot_files(files, last_chats=1)
+
+        self.assertEqual(latest, [Path("new.json.gz")])
 
     def test_falls_back_to_exported_at_for_old_snapshots(self) -> None:
         files = [Path("snapshot.json.gz")]
