@@ -487,6 +487,15 @@ def export_conversation(
                 bubble_id = key[len(f"bubbleId:{composer_id}:"):]
                 bubbles[bubble_id] = val
 
+        # New chats use this chunked log as the ordered list of bubbles to
+        # render, while leaving fullConversationHeadersOnly empty.
+        header_chunks = {}
+        header_prefix = f"composerConvHeaders:{composer_id}:"
+        for key in _cdb.list_keys(header_prefix):
+            val = _cdb.get_json(key)
+            if val is not None:
+                header_chunks[key[len(header_prefix):]] = val
+
         # Content blobs referenced by this conversation
         conv_json = json.dumps(conv_data)
         blobs = {}
@@ -520,7 +529,7 @@ def export_conversation(
         agent_blobs = _extract_agent_blobs(conv_data, _cdb)
 
         snapshot = {
-            "version": 3,
+            "version": 4,
             "exportedAt": datetime.now(timezone.utc).isoformat(),
             "sourceMachine": paths.get_machine_id(),
             "sourceHost": source_host,
@@ -531,6 +540,7 @@ def export_conversation(
             "composerHeader": composer_header,
             "contentBlobs": blobs,
             "bubbleEntries": bubbles,
+            "conversationHeaderChunks": header_chunks,
             "checkpoints": checkpoints,
             "agentBlobs": agent_blobs,
             "transcript": get_transcript(project_path, composer_id),

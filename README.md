@@ -208,7 +208,7 @@ All commands default to the current working directory as the project path. Use `
 | **`push -s`**  | **Interactively select which conversations to push**       | No                    |
 | **`pull`**     | **Pull from remote + import snapshots**                    | Yes                   |
 | `init`         | Initialize sync (git remote, S3 bucket, etc.)              | No                    |
-| `workspaces`   | List all Cursor workspaces (local, SSH, custom) with hash  | With `--delete`       |
+| `workspaces`   | List and manage Cursor workspaces (local, SSH, custom)     | With `--delete` or `--convert` |
 | `list`         | Show conversations for a project                           | No                    |
 | `snapshots`    | List snapshot projects available in ~/.cursaves/           | No                    |
 | `status`       | Compare local conversations vs snapshots                   | No                    |
@@ -235,6 +235,18 @@ cursaves purge --older-than 30 --yes  # skip confirmation
 Chats without a known update or creation date are retained. Add `-w <name>` to limit the purge to a workspace. Synced snapshots are not deleted.
 
 To completely remove a Cursor workspace and its local chats, quit Cursor and run `cursaves workspaces --delete`. You can also pass a workspace number, hash, or path substring, for example `cursaves workspaces --delete 497e8ab0`. Source project files and synced snapshots are preserved, and a recovery copy of the workspace database is stored under `~/.config/cursaves/backups/workspaces/`.
+
+To reuse a workspace's chats after moving between Cursor's SSH and local modes, quit Cursor and convert its metadata in place:
+
+```bash
+# SSH to local; --path can be omitted when the path is unchanged
+cursaves workspaces --convert 3 --to local --path /Users/you/repos/myapp
+
+# Local to SSH
+cursaves workspaces --convert 3 --to ssh --host core --path /home/you/repos/myapp
+```
+
+Omit the selector after `--convert` to choose a workspace interactively. The command preserves the workspace hash and chats, updates Cursor 3.0's global chat headers, and creates recovery backups before writing.
 
 ### Auto-sync with `watch`
 

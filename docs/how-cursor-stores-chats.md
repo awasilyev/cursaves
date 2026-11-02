@@ -58,17 +58,18 @@ In Cursor ≤2.6, this is what populates the **sidebar** — the list of convers
 
 This single database stores the actual conversation content for **all projects**. It has the same two tables (`ItemTable`, `cursorDiskKV`). Conversation data lives in `cursorDiskKV`. In Cursor 3.0+, the central chat-workspace index (`composer.composerHeaders`) lives in `ItemTable`.
 
-The global DB stores five types of entries for each conversation, all keyed by `composerId`:
+The global DB stores these types of entries for each conversation, keyed by `composerId`:
 
 | Key pattern | Content |
 |-------------|---------|
 | `composerData:{composerId}` | Conversation metadata, headers, and state |
 | `bubbleId:{composerId}:{bubbleId}` | Individual message content (one per message) |
+| `composerConvHeaders:{composerId}:{chunk}` | Chunked ordered message headers used by newer chats |
 | `checkpointId:{composerId}:{checkpointId}` | Workspace state snapshots (file diffs per agent turn) |
 | `messageRequestContext:{composerId}:{messageId}` | Full request context sent to the model |
 | `composer.content.{hash}` | Content-addressed blobs (shared across conversations) |
 
-All of these are required for a conversation to be fully functional on another machine. Missing `composerData` or `bubbleId` entries means the conversation can't render. Missing `checkpointId` entries means the conversation can't be continued (agent mode fails with "Blob not found").
+All of these are required for a conversation to be fully functional on another machine. Missing `composerData` or `bubbleId` entries means the conversation can't render. For chats with `composerData.headerLog`, missing `composerConvHeaders` chunks produces a chat that appears in the sidebar but renders blank. Missing `checkpointId` entries means the conversation can't be continued (agent mode fails with "Blob not found").
 
 ### How a conversation loads
 
@@ -274,7 +275,8 @@ Each `composerData:{UUID}` entry in the global DB is a JSON object with this str
 
 | Field | Description |
 |-------|-------------|
-| `fullConversationHeadersOnly` | Ordered list of messages. Each has a `bubbleId` (UUID) and a `type` (1 = user, 2 = assistant). |
+| `fullConversationHeadersOnly` | Legacy/earlier ordered list of messages. Newer chats may leave it empty. |
+| `headerLog` | Metadata (`chunkCount`, `count`, and generation) for external `composerConvHeaders` chunks. |
 | `conversationMap` | Legacy message content, keyed by bubble ID. Empty in newer conversations. |
 | `context` | What files, folders, terminals, docs, rules, etc. were attached as context. |
 | `unifiedMode` | The conversation mode: `"agent"`, `"chat"`, `"plan"`, `"edit"`. |
@@ -312,14 +314,15 @@ A typical bubble entry contains ~60+ fields. Some notable ones:
 | `allThinkingBlocks` | The model's chain-of-thought reasoning blocks |
 | `createdAt` | Timestamp for this individual message |
 
-A conversation with 1000 messages will have 1000 separate `bubbleId:` entries in the global DB. The `composerData` entry's `fullConversationHeadersOnly` array provides the ordering, while the actual content lives in these individual entries.
+A conversation with 1000 messages will have roughly 1000 separate `bubbleId:` entries in the global DB. The actual content lives in these individual entries. Ordering comes from `fullConversationHeadersOnly` in earlier chats or `composerConvHeaders:{composerId}:{chunk}` in newer chats.
 
 ### How to identify the storage format
 
 - **Legacy (v1/v2):** `conversationMap` in `composerData` is populated with message content
 - **Current (v3):** `conversationMap` is empty or absent; messages are in `bubbleId:` entries
+- **Chunked headers (late 2026):** `fullConversationHeadersOnly` is empty, `headerLog` is present, and ordering is in `composerConvHeaders:` entries
 
-Both formats use `fullConversationHeadersOnly` as the ordered message index.
+Snapshots must preserve the ordered message index used by the source chat as well as its bubble entries.
 
 ## Checkpoint Data
 

@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote, unquote
 
 
 def get_cursor_user_dir() -> Path:
@@ -96,7 +97,7 @@ def _parse_workspace_location(data: dict) -> Optional[tuple[str, str, Optional[s
     if not uri:
         return None
     if uri.startswith("file://"):
-        return uri, uri[len("file://"):].replace("%20", " "), None, (
+        return uri, unquote(uri[len("file://"):]), None, (
             "workspace" if is_workspace else "local"
         )
     if uri.startswith("vscode-remote://"):
@@ -110,8 +111,30 @@ def _parse_workspace_location(data: dict) -> Optional[tuple[str, str, Optional[s
             host = authority.split("+", 1)[1]
         else:
             host = None
-        return uri, "/" + parts[3], _decode_ssh_host(host) if host else None, "ssh"
+        decoded_host = unquote(host) if host else None
+        return uri, unquote("/" + parts[3]), (
+            _decode_ssh_host(decoded_host) if decoded_host else None
+        ), "ssh"
     return None
+
+
+def build_workspace_uri(
+    workspace_type: str,
+    project_path: str,
+    host: str | None = None,
+) -> str:
+    """Build a local or SSH folder URI accepted by Cursor."""
+    normalized_path = os.path.normpath(os.path.expanduser(project_path))
+    if not os.path.isabs(normalized_path):
+        raise ValueError("Workspace path must be absolute")
+    encoded_path = quote(normalized_path, safe="/")
+    if workspace_type == "local":
+        return f"file://{encoded_path}"
+    if workspace_type == "ssh":
+        if not host:
+            raise ValueError("SSH workspace conversion requires a host")
+        return f"vscode-remote://ssh-remote%2B{quote(host, safe='')}{encoded_path}"
+    raise ValueError(f"Unsupported workspace type: {workspace_type}")
 
 
 def find_workspace_dirs_for_project(project_path: str) -> list[Path]:

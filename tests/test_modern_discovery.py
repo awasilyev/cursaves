@@ -100,7 +100,9 @@ class ModernDiscoveryTests(unittest.TestCase):
 
         self.patches = [
             patch.object(paths, "get_global_db_path", return_value=self.global_db),
-            patch.object(paths, "get_workspace_storage_dir", return_value=self.workspace_storage),
+            patch.object(
+                paths, "get_workspace_storage_dir", return_value=self.workspace_storage
+            ),
             patch.object(paths, "get_project_identifier", return_value="project"),
         ]
         for item in self.patches:
@@ -180,6 +182,11 @@ class ModernDiscoveryTests(unittest.TestCase):
         add_modern_header(self.global_db, "archived", source_ws.name, archived=True)
         add_composer_data(self.global_db, "archived", "Archived chat")
         put_json(self.global_db, "bubbleId:archived:bubble-1", {"text": "hello"})
+        put_json(
+            self.global_db,
+            "composerConvHeaders:archived:000000",
+            [{"bubbleId": "bubble-1", "type": 1}],
+        )
         put_json(self.global_db, "checkpointId:archived:checkpoint-1", {"path": "/source/project"})
 
         header = paths._build_global_headers_map()[source_ws.name][0]
@@ -188,6 +195,10 @@ class ModernDiscoveryTests(unittest.TestCase):
         )
         self.assertTrue(snapshot["composerHeader"]["isArchived"])
         self.assertEqual(snapshot["bubbleEntries"]["bubble-1"]["text"], "hello")
+        self.assertEqual(
+            snapshot["conversationHeaderChunks"]["000000"],
+            [{"bubbleId": "bubble-1", "type": 1}],
+        )
         self.assertIn("checkpoint-1", snapshot["checkpoints"])
 
         snapshot_path = self.root / "archived.json.gz"
@@ -196,6 +207,10 @@ class ModernDiscoveryTests(unittest.TestCase):
 
         destination_db = self.root / "destination" / "state.vscdb"
         create_db(destination_db, modern=True)
+        # Simulate a restore made by an older cursaves: all bubbles are there,
+        # but Cursor renders the chat blank because its header chunk is absent.
+        put_json(destination_db, "composerData:archived", snapshot["composerData"])
+        put_json(destination_db, "bubbleId:archived:bubble-1", {"text": "hello"})
         destination_ws = self.root / "destination-workspaces" / "target"
         destination_ws.mkdir(parents=True)
         (destination_ws / "workspace.json").write_text(
@@ -220,6 +235,10 @@ class ModernDiscoveryTests(unittest.TestCase):
             self.assertEqual(
                 cdb.get_json("bubbleId:archived:bubble-1")["text"], "hello"
             )
+            self.assertEqual(
+                cdb.get_json("composerConvHeaders:archived:000000"),
+                [{"bubbleId": "bubble-1", "type": 1}],
+            )
             self.assertIsNotNone(cdb.get_json("checkpointId:archived:checkpoint-1"))
 
     def test_copy_preserves_archived_header(self) -> None:
@@ -227,6 +246,11 @@ class ModernDiscoveryTests(unittest.TestCase):
         target_ws = self.make_workspace("target", {"folder": "file:///target/project"})
         add_modern_header(self.global_db, "archived", source_ws.name, archived=True)
         add_composer_data(self.global_db, "archived", "Archived chat")
+        put_json(
+            self.global_db,
+            "composerConvHeaders:archived:000000",
+            [{"bubbleId": "bubble-1", "type": 1}],
+        )
 
         success, failure = importer.copy_between_workspaces(
             ["archived"],
@@ -247,6 +271,13 @@ class ModernDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(copied), 1)
         self.assertNotEqual(copied[0]["composerId"], "archived")
         self.assertTrue(copied[0]["isArchived"])
+        with db.CursorDB(self.global_db) as cdb:
+            self.assertEqual(
+                cdb.get_json(
+                    f"composerConvHeaders:{copied[0]['composerId']}:000000"
+                ),
+                [{"bubbleId": "bubble-1", "type": 1}],
+            )
 
 
 class LegacyDiscoveryTests(unittest.TestCase):
@@ -376,6 +407,107 @@ class WorkspaceDeletionTests(unittest.TestCase):
 
         self.assertNotEqual(resolved["workspace_dir"], empty)
         self.assertEqual(resolved["workspace_dir"], populated)
+
+
+class WorkspaceConversionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.global_db = self.root / "globalStorage" / "state.vscdb"
+        self.workspace_storage = self.root / "workspaceStorage"
+        create_db(self.global_db, modern=True)
+        paths.invalidate_headers_cache()
+        self.patches = [
+            patch.object(paths, "get_global_db_path", return_value=self.global_db),
+            patch.object(paths, "get_workspace_storage_dir", return_value=self.workspace_storage),
+            patch.dict("os.environ", {"HOME": str(self.root)}),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self) -> None:
+        for item in reversed(self.patches):
+            item.stop()
+        paths.invalidate_headers_cache()
+        self.temp.cleanup()
+
+    def test_convert_ssh_to_local_and_back_updates_header_uris(self) -> None:
+        workspace = self.workspace_storage / "workspace-id"
+        workspace.mkdir(parents=True)
+        original_workspace_data = {
+            "folder": "vscode-remote://ssh-remote%2Bcore/home/user/my%20app",
+            "unknown": {"preserved": True},
+        }
+        (workspace / "workspace.json").write_text(json.dumps(original_workspace_data))
+        create_db(workspace / "state.vscdb")
+        add_modern_header(self.global_db, "modern-chat", workspace.name)
+        put_json(
+            self.global_db,
+            "composer.composerHeaders",
+            {
+                "unknown": "preserved",
+                "allComposers": [{
+                    "composerId": "legacy-chat",
+                    "workspaceIdentifier": {"id": workspace.name, "extra": 1},
+                }],
+            },
+            table="ItemTable",
+        )
+
+        result = importer.convert_workspace_type(
+            workspace, "local", "/Users/test/my app", force=True
+        )
+
+        self.assertIsNotNone(result)
+        workspace_backup, global_backup, updated = result
+        self.assertEqual(updated, 2)
+        self.assertEqual(
+            json.loads(workspace_backup.read_text()), original_workspace_data
+        )
+        self.assertIsNotNone(global_backup)
+        self.assertTrue(global_backup.exists())
+        converted = json.loads((workspace / "workspace.json").read_text())
+        self.assertEqual(converted["folder"], "file:///Users/test/my%20app")
+        self.assertEqual(converted["unknown"], {"preserved": True})
+
+        with db.CursorDB(self.global_db) as cdb:
+            modern = cdb.get_composer_headers()[0]
+            self.assertEqual(
+                modern["workspaceIdentifier"]["uri"]["external"],
+                "file:///Users/test/my%20app",
+            )
+            legacy = cdb.get_json("composer.composerHeaders", table="ItemTable")
+            self.assertEqual(legacy["unknown"], "preserved")
+            self.assertEqual(
+                legacy["allComposers"][0]["workspaceIdentifier"]["extra"], 1
+            )
+
+        importer.convert_workspace_type(
+            workspace, "ssh", "/home/user/my app", host="new host", force=True
+        )
+        converted = json.loads((workspace / "workspace.json").read_text())
+        self.assertEqual(
+            converted["folder"],
+            "vscode-remote://ssh-remote%2Bnew%20host/home/user/my%20app",
+        )
+        location = paths._parse_workspace_location(converted)
+        self.assertEqual(location[1:], ("/home/user/my app", "new host", "ssh"))
+
+    def test_conversion_refuses_to_write_while_cursor_is_running(self) -> None:
+        workspace = self.workspace_storage / "workspace-id"
+        workspace.mkdir(parents=True)
+        workspace_json = workspace / "workspace.json"
+        workspace_json.write_text(json.dumps({"folder": "file:///project"}))
+
+        with patch.object(importer, "is_cursor_running", return_value=True):
+            result = importer.convert_workspace_type(
+                workspace, "ssh", "/project", host="core"
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            json.loads(workspace_json.read_text()), {"folder": "file:///project"}
+        )
 
 
 class ConversationSelectionTests(unittest.TestCase):

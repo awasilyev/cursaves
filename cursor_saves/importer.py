@@ -249,6 +249,7 @@ def _check_conflict(
     composer_id: str,
     incoming_bubble_ids: set[str],
     incoming_header_ids: Optional[set[str]] = None,
+    incoming_header_chunk_ids: Optional[set[str]] = None,
 ) -> str:
     """Compare local chat state against incoming snapshot.
 
@@ -270,6 +271,12 @@ def _check_conflict(
     with db.CursorDB(global_db_path) as cdb:
         local_keys = cdb.list_keys(f"bubbleId:{composer_id}:")
         local_data = cdb.get_json(f"composerData:{composer_id}")
+        local_chunk_ids = set()
+        if incoming_header_chunk_ids:
+            chunk_prefix = f"composerConvHeaders:{composer_id}:"
+            local_chunk_ids = {
+                key[len(chunk_prefix):] for key in cdb.list_keys(chunk_prefix)
+            }
 
     if not local_keys:
         return "new"
@@ -279,6 +286,12 @@ def _check_conflict(
 
     prefix_len = len(f"bubbleId:{composer_id}:")
     local_bubble_ids = {k[prefix_len:] for k in local_keys}
+
+    # Earlier imports can contain every bubble but still render blank because
+    # they predate support for Cursor's separate conversation-header chunks.
+    missing_header_chunks = set()
+    if incoming_header_chunk_ids:
+        missing_header_chunks = incoming_header_chunk_ids - local_chunk_ids
 
     local_only_bubbles = local_bubble_ids - incoming_bubble_ids
     incoming_only_bubbles = incoming_bubble_ids - local_bubble_ids
@@ -295,7 +308,11 @@ def _check_conflict(
         incoming_only_headers = incoming_header_ids - local_header_ids
 
     has_local_only = bool(local_only_bubbles)
-    has_incoming_only = bool(incoming_only_bubbles) or bool(incoming_only_headers)
+    has_incoming_only = (
+        bool(incoming_only_bubbles)
+        or bool(incoming_only_headers)
+        or bool(missing_header_chunks)
+    )
 
     if not has_local_only and not has_incoming_only:
         return "identical"
@@ -331,7 +348,7 @@ def import_snapshot(
         print(f"Error reading snapshot: {e}", file=sys.stderr)
         return False
 
-    if snapshot.get("version") not in (1, 2, 3):
+    if snapshot.get("version") not in (1, 2, 3, 4):
         print(f"Error: Unsupported snapshot version: {snapshot.get('version')}", file=sys.stderr)
         return False
 
@@ -355,6 +372,7 @@ def import_snapshot(
     content_blobs = snapshot.get("contentBlobs", {})
     message_contexts = snapshot.get("messageContexts", {})
     bubble_entries = snapshot.get("bubbleEntries", {})
+    header_chunks = snapshot.get("conversationHeaderChunks", {})
     checkpoints = snapshot.get("checkpoints", {})
     agent_blobs = snapshot.get("agentBlobs", {})
 
@@ -365,7 +383,11 @@ def import_snapshot(
         h.get("bubbleId") for h in headers if h.get("bubbleId")
     }
     conflict = _check_conflict(
-        global_db_path, composer_id, incoming_bubble_ids, incoming_header_ids,
+        global_db_path,
+        composer_id,
+        incoming_bubble_ids,
+        incoming_header_ids,
+        set(header_chunks),
     )
     chat_name = composer_data.get("name", "Untitled")
     source_label = snapshot.get("sourceHost") or snapshot.get("sourceMachine") or "remote"
@@ -450,6 +472,12 @@ def import_snapshot(
                 for bubble_id, bubble_data in bubble_entries.items()
             ])
 
+        if header_chunks:
+            global_cdb.write_json_batch([
+                (f"composerConvHeaders:{composer_id}:{chunk_id}", chunk_data)
+                for chunk_id, chunk_data in header_chunks.items()
+            ])
+
         # Write checkpoint data (workspace state snapshots for agent continuation)
         if checkpoints:
             if source_path and source_path != target_path:
@@ -502,6 +530,17 @@ def import_snapshot(
             sample = verify_cdb.get_json(f"bubbleId:{composer_id}:{sample_key}")
             if not sample:
                 print("  WARNING: bubble entries not found in global DB after write!", file=sys.stderr)
+                return False
+        if header_chunks:
+            sample_key = next(iter(header_chunks))
+            sample = verify_cdb.get_json(
+                f"composerConvHeaders:{composer_id}:{sample_key}"
+            )
+            if sample is None:
+                print(
+                    "  WARNING: conversation header chunks not found in global DB after write!",
+                    file=sys.stderr,
+                )
                 return False
 
         final_name = composer_data.get("name", chat_name)
@@ -900,9 +939,17 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
     if not folder_uri:
         return {"id": ws_hash}
 
+    uri_obj = _build_uri_object(folder_uri)
+    return {"id": ws_hash, "uri": uri_obj} if uri_obj else {"id": ws_hash}
+
+
+def _build_uri_object(folder_uri: str) -> Optional[dict]:
+    """Build Cursor's serialized URI object for a workspace folder URI."""
+    from urllib.parse import unquote
+
     uri_obj: dict = {"$mid": 1}
     if folder_uri.startswith("file://"):
-        fs_path = folder_uri[len("file://"):].replace("%20", " ")
+        fs_path = unquote(folder_uri[len("file://"):])
         uri_obj["fsPath"] = fs_path
         uri_obj["path"] = fs_path
         uri_obj["external"] = folder_uri
@@ -910,16 +957,15 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
     elif folder_uri.startswith("vscode-remote://"):
         parts = folder_uri.split("/", 3)
         authority = parts[2] if len(parts) > 2 else ""
-        fs_path = "/" + parts[3] if len(parts) > 3 else "/"
+        fs_path = unquote("/" + parts[3]) if len(parts) > 3 else "/"
         uri_obj["fsPath"] = fs_path
         uri_obj["path"] = fs_path
         uri_obj["external"] = folder_uri
         uri_obj["scheme"] = "vscode-remote"
         uri_obj["authority"] = authority
     else:
-        return {"id": ws_hash}
-
-    return {"id": ws_hash, "uri": uri_obj}
+        return None
+    return uri_obj
 
 
 def _register_in_global_headers(
@@ -1119,6 +1165,21 @@ def copy_between_workspaces(
                         bubble_items.append((f"bubbleId:{new_id}:{bubble_id}", val))
                 if bubble_items:
                     write_cdb.write_json_batch(bubble_items)
+
+            # Copy the ordered render headers used by recent Cursor versions.
+            header_prefix = f"composerConvHeaders:{old_id}:"
+            header_keys = read_cdb.list_keys(header_prefix)
+            if header_keys:
+                header_items = []
+                for key in header_keys:
+                    chunk_id = key[len(header_prefix):]
+                    val = read_cdb.get_json(key)
+                    if val is not None:
+                        header_items.append(
+                            (f"composerConvHeaders:{new_id}:{chunk_id}", val)
+                        )
+                if header_items:
+                    write_cdb.write_json_batch(header_items)
 
             # Copy message contexts
             ctx_keys = read_cdb.list_keys(f"messageRequestContext:{old_id}:")
@@ -1887,6 +1948,9 @@ def purge_chats(
             keys_deleted = 0
             keys_deleted += write_cdb.delete_keys([f"composerData:{cid}"])
             keys_deleted += write_cdb.delete_keys_by_prefix(f"bubbleId:{cid}:")
+            keys_deleted += write_cdb.delete_keys_by_prefix(
+                f"composerConvHeaders:{cid}:"
+            )
             keys_deleted += write_cdb.delete_keys_by_prefix(f"checkpointId:{cid}:")
             keys_deleted += write_cdb.delete_keys_by_prefix(f"messageRequestContext:{cid}:")
             total_keys += keys_deleted
@@ -2006,3 +2070,101 @@ def delete_workspace(
     shutil.rmtree(workspace_dir)
     paths.invalidate_headers_cache()
     return deleted_chats, deleted_keys, backup_dir
+
+
+def convert_workspace_type(
+    workspace_dir: Path,
+    target_type: str,
+    project_path: str,
+    host: Optional[str] = None,
+    force: bool = False,
+) -> Optional[tuple[Path, Optional[Path], int]]:
+    """Convert a workspace between local and SSH metadata representations."""
+    workspace_dir = workspace_dir.resolve()
+    storage_dir = paths.get_workspace_storage_dir().resolve()
+    if workspace_dir.parent != storage_dir or not workspace_dir.is_dir():
+        raise ValueError(f"Not a Cursor workspace directory: {workspace_dir}")
+    if not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command again.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return None
+
+    workspace_json = workspace_dir / "workspace.json"
+    try:
+        workspace_data = json.loads(workspace_json.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read workspace metadata: {workspace_json}") from exc
+    if not isinstance(workspace_data, dict):
+        raise ValueError(f"Invalid workspace metadata: {workspace_json}")
+    location = paths._parse_workspace_location(workspace_data)
+    if not location or location[3] not in {"local", "ssh"}:
+        raise ValueError("Only local and SSH folder workspaces can be converted")
+    if location[3] == target_type:
+        raise ValueError(f"Workspace is already {target_type}")
+
+    folder_uri = paths.build_workspace_uri(target_type, project_path, host)
+    new_data = dict(workspace_data)
+    new_data["folder"] = folder_uri
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_dir = (
+        Path.home() / ".config" / "cursaves" / "backups" / "workspaces"
+        / f"{workspace_dir.name}_{timestamp}"
+    )
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    workspace_backup = backup_dir / "workspace.json"
+    shutil.copy2(workspace_json, workspace_backup)
+    pending_workspace_json = workspace_dir / f".workspace.json.{timestamp}.tmp"
+    pending_workspace_json.write_text(json.dumps(new_data, separators=(",", ":")))
+
+    global_backup = None
+    headers_updated = 0
+    global_db_path = paths.get_global_db_path()
+    if global_db_path.exists():
+        uri_obj = _build_uri_object(folder_uri)
+        global_cdb = db.CursorDB(global_db_path)
+        try:
+            modern_headers = global_cdb.get_composer_headers(include_subagents=True)
+            legacy_headers = global_cdb.get_json(
+                "composer.composerHeaders", table="ItemTable"
+            )
+            def belongs_to_workspace(header: dict) -> bool:
+                identifier = header.get("workspaceIdentifier", {})
+                return (
+                    isinstance(identifier, dict)
+                    and identifier.get("id") == workspace_dir.name
+                )
+
+            modern_matches = any(belongs_to_workspace(h) for h in modern_headers)
+            legacy_entries = (
+                legacy_headers.get("allComposers", [])
+                if isinstance(legacy_headers, dict) else []
+            )
+            legacy_matches = any(
+                belongs_to_workspace(h) for h in legacy_entries if isinstance(h, dict)
+            )
+            if modern_matches or legacy_matches:
+                global_backup = db.backup_db(global_db_path)
+            if modern_matches and uri_obj:
+                headers_updated += global_cdb.update_workspace_identifier_uri(
+                    workspace_dir.name, uri_obj
+                )
+            if legacy_matches and uri_obj:
+                for header in legacy_entries:
+                    identifier = header.get("workspaceIdentifier", {})
+                    if belongs_to_workspace(header):
+                        header["workspaceIdentifier"] = {**identifier, "uri": uri_obj}
+                        headers_updated += 1
+                global_cdb.write_json(
+                    "composer.composerHeaders", legacy_headers, table="ItemTable"
+                )
+        finally:
+            global_cdb.close()
+
+    pending_workspace_json.replace(workspace_json)
+    paths.invalidate_headers_cache()
+    return workspace_backup, global_backup, headers_updated

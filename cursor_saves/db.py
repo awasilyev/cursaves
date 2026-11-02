@@ -298,6 +298,41 @@ class CursorDB:
         )
         conn.commit()
 
+    def update_workspace_identifier_uri(self, workspace_id: str, uri: dict) -> int:
+        """Update header URI metadata without changing any indexed columns."""
+        if not self.table_exists("composerHeaders"):
+            return 0
+        conn = self._get_write_conn()
+        rows = conn.execute(
+            "SELECT composerId, value FROM composerHeaders WHERE workspaceId = ?",
+            (workspace_id,),
+        ).fetchall()
+        updates = []
+        for composer_id, raw_value in rows:
+            try:
+                entry = json.loads(raw_value) if raw_value else {}
+            except (TypeError, json.JSONDecodeError):
+                entry = {}
+            if not isinstance(entry, dict):
+                entry = {}
+            identifier = entry.get("workspaceIdentifier", {})
+            if not isinstance(identifier, dict):
+                identifier = {}
+            entry["composerId"] = entry.get("composerId", composer_id)
+            entry["workspaceIdentifier"] = {
+                **identifier,
+                "id": workspace_id,
+                "uri": uri,
+            }
+            updates.append((json.dumps(entry, separators=(",", ":")), composer_id))
+
+        if updates:
+            conn.executemany(
+                "UPDATE composerHeaders SET value = ? WHERE composerId = ?", updates
+            )
+            conn.commit()
+        return len(updates)
+
     def delete_composer_headers(self, composer_ids: list[str]) -> int:
         """Delete modern composer header rows for the given conversations."""
         if not composer_ids or not self.table_exists("composerHeaders"):

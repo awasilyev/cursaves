@@ -11,6 +11,7 @@ from typing import Optional
 from . import __version__, db, export, paths
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
 from .importer import (
+    convert_workspace_type,
     copy_between_workspaces,
     doctor_audit,
     doctor_recover,
@@ -168,6 +169,10 @@ def cmd_workspaces(args):
     if delete_selector is not None:
         _delete_workspace(args, delete_selector)
         return
+    convert_selector = getattr(args, "convert", None)
+    if convert_selector is not None:
+        _convert_workspace(args, convert_selector)
+        return
 
     workspaces = paths.list_workspaces_with_conversations()
     if not workspaces:
@@ -266,6 +271,82 @@ def _delete_workspace(args, selector: str) -> None:
         f"({deleted_keys:,} DB keys)."
     )
     print(f"  Recovery backup: {backup_dir}")
+
+
+def _convert_workspace(args, selector: str) -> None:
+    """Select, confirm, and convert one workspace between local and SSH."""
+    from .interactive import confirm as tui_confirm, select_workspace
+
+    target_type = getattr(args, "target_type", None)
+    if not target_type:
+        print("Error: --to is required with --convert.", file=sys.stderr)
+        return
+
+    if selector:
+        workspace = paths.resolve_workspace(selector, include_empty=True)
+        if workspace is None:
+            print(f"Error: No workspace matching '{selector}'.", file=sys.stderr)
+            return
+    else:
+        workspaces = [
+            ws for ws in paths.list_all_workspaces()
+            if ws["type"] in {"local", "ssh"} and ws["type"] != target_type
+        ]
+        for workspace_item in workspaces:
+            workspace_db = workspace_item["workspace_dir"] / "state.vscdb"
+            workspace_item["conversations"] = (
+                len(paths.get_workspace_composer_ids(workspace_db))
+                if workspace_db.exists() else 0
+            )
+        workspace = select_workspace(workspaces)
+        if workspace is None:
+            return
+
+    if workspace["type"] not in {"local", "ssh"}:
+        print("Error: Custom .code-workspace entries cannot be converted.", file=sys.stderr)
+        return
+    if workspace["type"] == target_type:
+        print(f"Error: Workspace is already {target_type}.", file=sys.stderr)
+        return
+
+    project_path = getattr(args, "convert_path", None) or workspace["path"]
+    host = getattr(args, "host", None)
+    if target_type == "ssh" and not host:
+        print("Error: --host is required when converting to SSH.", file=sys.stderr)
+        return
+    try:
+        target_uri = paths.build_workspace_uri(target_type, project_path, host)
+    except ValueError as exc:
+        print(f"Error: {exc}.", file=sys.stderr)
+        return
+
+    print(f"\n  Workspace: {paths.format_workspace_display(workspace)}")
+    print(f"  Convert to: {target_type}")
+    print(f"  New URI:    {target_uri}")
+    if not getattr(args, "yes", False) and not tui_confirm("Convert this workspace?"):
+        print("  Cancelled.")
+        return
+
+    try:
+        result = convert_workspace_type(
+            workspace["workspace_dir"],
+            target_type,
+            project_path,
+            host=host,
+            force=getattr(args, "force", False),
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}.", file=sys.stderr)
+        return
+    if result is None:
+        return
+    workspace_backup, global_backup, headers_updated = result
+    print(f"\n  Converted workspace to {target_type}.")
+    print(f"  Updated {headers_updated} chat header(s).")
+    print(f"  Workspace metadata backup: {workspace_backup}")
+    if global_backup:
+        print(f"  Global DB backup: {global_backup}")
+    print_reload_hint()
 
 
 def _is_remote_path(path: str, source_machine: str) -> bool:
@@ -1873,17 +1954,34 @@ def main():
     p_workspaces = subparsers.add_parser(
         "workspaces", help="List all Cursor workspaces (local and SSH remote)"
     )
-    p_workspaces.add_argument(
+    workspace_action = p_workspaces.add_mutually_exclusive_group()
+    workspace_action.add_argument(
         "--delete", nargs="?", const="", metavar="SELECTOR",
         help="Delete a workspace by number, hash, or path; omit SELECTOR to choose interactively",
     )
+    workspace_action.add_argument(
+        "--convert", nargs="?", const="", metavar="SELECTOR",
+        help="Convert a workspace between local and SSH; omit SELECTOR to choose interactively",
+    )
+    p_workspaces.add_argument(
+        "--to", dest="target_type", choices=["local", "ssh"],
+        help="Target type for --convert",
+    )
+    p_workspaces.add_argument(
+        "--path", dest="convert_path", metavar="PATH",
+        help="Target project path for --convert (default: current workspace path)",
+    )
+    p_workspaces.add_argument(
+        "--host", metavar="HOST",
+        help="SSH host or alias (required with --to ssh)",
+    )
     p_workspaces.add_argument(
         "--yes", "-y", action="store_true",
-        help="Skip the deletion confirmation prompt",
+        help="Skip the confirmation prompt",
     )
     p_workspaces.add_argument(
         "--force", action="store_true",
-        help="Delete even if Cursor appears to be running",
+        help="Modify data even if Cursor appears to be running",
     )
     p_workspaces.set_defaults(func=cmd_workspaces)
 
@@ -2121,6 +2219,7 @@ def main():
             "\n"
             "  workspaces            List Cursor workspaces (local + SSH)\n"
             "  workspaces --delete   Select and completely delete a workspace\n"
+            "  workspaces --convert  Convert a workspace between local and SSH\n"
             "  list                  List chats for this project\n"
             "  snapshots             List saved snapshots in ~/.cursaves/\n"
             "  status                Show synced vs local-only chats\n"
