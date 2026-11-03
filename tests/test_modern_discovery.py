@@ -181,6 +181,12 @@ class ModernDiscoveryTests(unittest.TestCase):
         source_ws = self.make_workspace("source", {"folder": "file:///source/project"})
         add_modern_header(self.global_db, "archived", source_ws.name, archived=True)
         add_composer_data(self.global_db, "archived", "Archived chat")
+        put_json(
+            source_ws / "state.vscdb",
+            "cursor/pinnedComposers",
+            ["another-chat", "archived"],
+            table="ItemTable",
+        )
         put_json(self.global_db, "bubbleId:archived:bubble-1", {"text": "hello"})
         put_json(
             self.global_db,
@@ -194,6 +200,7 @@ class ModernDiscoveryTests(unittest.TestCase):
             "/source/project", "archived", composer_header=header
         )
         self.assertTrue(snapshot["composerHeader"]["isArchived"])
+        self.assertTrue(snapshot["isPinned"])
         self.assertEqual(snapshot["bubbleEntries"]["bubble-1"]["text"], "hello")
         self.assertEqual(
             snapshot["conversationHeaderChunks"]["000000"],
@@ -240,6 +247,45 @@ class ModernDiscoveryTests(unittest.TestCase):
                 [{"bubbleId": "bubble-1", "type": 1}],
             )
             self.assertIsNotNone(cdb.get_json("checkpointId:archived:checkpoint-1"))
+        with db.CursorDB(destination_ws / "state.vscdb") as cdb:
+            self.assertEqual(
+                cdb.get_json("cursor/pinnedComposers", table="ItemTable"),
+                ["archived"],
+            )
+
+        # Pin metadata must still be applied when the conversation content is
+        # already identical and import_snapshot takes its fast skip path.
+        put_json(
+            destination_ws / "state.vscdb",
+            "cursor/pinnedComposers",
+            [],
+            table="ItemTable",
+        )
+        with patch.object(paths, "get_global_db_path", return_value=destination_db):
+            self.assertTrue(
+                importer.import_snapshot(
+                    snapshot_path,
+                    "/destination/project",
+                    target_workspace_dir=destination_ws,
+                    skip_backup=True,
+                )
+            )
+        with db.CursorDB(destination_ws / "state.vscdb") as cdb:
+            self.assertEqual(
+                cdb.get_json("cursor/pinnedComposers", table="ItemTable"),
+                ["archived"],
+            )
+
+    def test_original_db_reads_do_not_create_a_full_read_copy(self) -> None:
+        put_json(self.global_db, "composerData:direct", {"name": "Direct"})
+
+        with db.CursorDB(self.global_db) as cdb:
+            self.assertEqual(
+                cdb.get_original_json("composerData:direct"),
+                {"name": "Direct"},
+            )
+            self.assertTrue(cdb.original_table_exists("composerHeaders"))
+            self.assertIsNone(cdb._tmp_path)
 
     def test_copy_preserves_archived_header(self) -> None:
         source_ws = self.make_workspace("source", {"folder": "file:///source/project"})

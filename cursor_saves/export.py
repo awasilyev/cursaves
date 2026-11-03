@@ -451,6 +451,8 @@ def export_conversation(
     _cdb: Optional[db.CursorDB] = None,
     source_host: Optional[str] = None,
     composer_header: Optional[dict] = None,
+    workspace_dir: Optional[Path] = None,
+    is_pinned: Optional[bool] = None,
 ) -> Optional[dict]:
     """Export a single conversation to a self-contained snapshot dict.
 
@@ -470,6 +472,28 @@ def export_conversation(
             ),
             None,
         )
+    if workspace_dir is None and composer_header:
+        stored_workspace_dir = composer_header.get("_workspaceDir")
+        if stored_workspace_dir:
+            workspace_dir = Path(stored_workspace_dir)
+        else:
+            workspace_id = composer_header.get("workspaceIdentifier", {}).get("id")
+            if workspace_id:
+                workspace_dir = paths.get_workspace_storage_dir() / workspace_id
+
+    load_pin_from_workspace = is_pinned is None
+    if load_pin_from_workspace:
+        is_pinned = False
+    if workspace_dir is not None and load_pin_from_workspace:
+        workspace_db = workspace_dir / "state.vscdb"
+        if workspace_db.exists():
+            with db.CursorDB(workspace_db) as workspace_cdb:
+                pinned_ids = workspace_cdb.get_json(
+                    "cursor/pinnedComposers", table="ItemTable"
+                )
+                is_pinned = (
+                    isinstance(pinned_ids, list) and composer_id in pinned_ids
+                )
     own_cdb = _cdb is None
     if own_cdb:
         _cdb = db.CursorDB(global_db)
@@ -538,6 +562,7 @@ def export_conversation(
             "composerId": composer_id,
             "composerData": conv_data,
             "composerHeader": composer_header,
+            "isPinned": is_pinned,
             "contentBlobs": blobs,
             "bubbleEntries": bubbles,
             "conversationHeaderChunks": header_chunks,
@@ -648,6 +673,7 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "sourceProjectPath": snapshot.get("sourceProjectPath"),
         "projectIdentifier": snapshot.get("projectIdentifier"),
         "version": snapshot.get("version"),
+        "isPinned": snapshot.get("isPinned", False),
         "shardCount": num_shards if num_shards else None,
     }
     meta_file = project_dir / f"{composer_id}.meta.json"
@@ -698,9 +724,23 @@ def checkpoint_project(
 
     last_log_time = t0
     saved = []
+    pinned_ids_by_workspace: dict[Path, set[str]] = {}
     global_db = paths.get_global_db_path()
     with db.CursorDB(global_db) as cdb:
         for i, (c, composer_id) in enumerate(to_process, 1):
+            source_workspace_dir = Path(c["_workspaceDir"])
+            if source_workspace_dir not in pinned_ids_by_workspace:
+                workspace_db = source_workspace_dir / "state.vscdb"
+                pinned_ids: set[str] = set()
+                if workspace_db.exists():
+                    with db.CursorDB(workspace_db) as workspace_cdb:
+                        stored_pins = workspace_cdb.get_json(
+                            "cursor/pinnedComposers", table="ItemTable"
+                        )
+                    if isinstance(stored_pins, list):
+                        pinned_ids = set(stored_pins)
+                pinned_ids_by_workspace[source_workspace_dir] = pinned_ids
+
             # Export the conversation
             snapshot = export_conversation(
                 project_path,
@@ -708,6 +748,8 @@ def checkpoint_project(
                 _cdb=cdb,
                 source_host=source_host,
                 composer_header=c,
+                workspace_dir=source_workspace_dir,
+                is_pinned=composer_id in pinned_ids_by_workspace[source_workspace_dir],
             )
             if snapshot:
                 path = save_snapshot(snapshot, snapshots_dir)

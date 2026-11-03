@@ -250,6 +250,7 @@ def _check_conflict(
     incoming_bubble_ids: set[str],
     incoming_header_ids: Optional[set[str]] = None,
     incoming_header_chunk_ids: Optional[set[str]] = None,
+    read_cdb: "Optional[db.CursorDB]" = None,
 ) -> str:
     """Compare local chat state against incoming snapshot.
 
@@ -268,7 +269,9 @@ def _check_conflict(
     if not global_db_path.exists():
         return "new"
 
-    with db.CursorDB(global_db_path) as cdb:
+    owns_cdb = read_cdb is None
+    cdb = read_cdb or db.CursorDB(global_db_path)
+    try:
         local_keys = cdb.list_keys(f"bubbleId:{composer_id}:")
         local_data = cdb.get_json(f"composerData:{composer_id}")
         local_chunk_ids = set()
@@ -277,6 +280,9 @@ def _check_conflict(
             local_chunk_ids = {
                 key[len(chunk_prefix):] for key in cdb.list_keys(chunk_prefix)
             }
+    finally:
+        if owns_cdb:
+            cdb.close()
 
     if not local_keys:
         return "new"
@@ -324,11 +330,40 @@ def _check_conflict(
         return "incoming_newer"
 
 
+def _ensure_workspace_pin(
+    composer_id: str,
+    workspace_dir: Optional[Path],
+    skip_backup: bool,
+) -> None:
+    """Add a composer to Cursor's workspace-level pinned chat list."""
+    if workspace_dir is None:
+        return
+    workspace_db = workspace_dir / "state.vscdb"
+    if not workspace_db.exists():
+        return
+
+    with db.CursorDB(workspace_db) as workspace_cdb:
+        pinned_ids = workspace_cdb.get_original_json(
+            "cursor/pinnedComposers", table="ItemTable"
+        )
+        if not isinstance(pinned_ids, list):
+            pinned_ids = []
+        if composer_id in pinned_ids:
+            return
+        if not skip_backup:
+            db.backup_db(workspace_db)
+        pinned_ids.append(composer_id)
+        workspace_cdb.write_json(
+            "cursor/pinnedComposers", pinned_ids, table="ItemTable"
+        )
+
+
 def import_snapshot(
     snapshot_path: Path,
     target_project_path: str,
     target_workspace_dir: Optional[Path] = None,
     skip_backup: bool = False,
+    _read_cdb: "Optional[db.CursorDB]" = None,
 ) -> bool:
     """Import a conversation snapshot into Cursor's databases.
 
@@ -388,13 +423,25 @@ def import_snapshot(
         incoming_bubble_ids,
         incoming_header_ids,
         set(header_chunks),
+        read_cdb=_read_cdb,
     )
     chat_name = composer_data.get("name", "Untitled")
     source_label = snapshot.get("sourceHost") or snapshot.get("sourceMachine") or "remote"
 
+    # Pinning is workspace metadata rather than conversation content. Restore
+    # it even when the messages themselves need no update.
+    if snapshot.get("isPinned") is True and conflict in ("identical", "local_ahead"):
+        pin_workspace_dir = target_workspace_dir or find_or_create_workspace(target_path)
+        _ensure_workspace_pin(
+            composer_id, pin_workspace_dir, skip_backup=skip_backup
+        )
+
     if conflict == "local_ahead":
-        with db.CursorDB(global_db_path) as cdb:
-            ld = cdb.get_json(f"composerData:{composer_id}")
+        if _read_cdb is not None:
+            ld = _read_cdb.get_json(f"composerData:{composer_id}")
+        else:
+            with db.CursorDB(global_db_path) as cdb:
+                ld = cdb.get_json(f"composerData:{composer_id}")
         local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
         snap_count = len(headers)
         print(
@@ -411,8 +458,11 @@ def import_snapshot(
         print(f"  New chat: \"{chat_name}\" ({len(headers)} msgs from {source_label})")
 
     if conflict == "incoming_newer":
-        with db.CursorDB(global_db_path) as cdb:
-            ld = cdb.get_json(f"composerData:{composer_id}")
+        if _read_cdb is not None:
+            ld = _read_cdb.get_json(f"composerData:{composer_id}")
+        else:
+            with db.CursorDB(global_db_path) as cdb:
+                ld = cdb.get_json(f"composerData:{composer_id}")
         local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
         snap_count = len(headers)
         print(
@@ -516,24 +566,24 @@ def import_snapshot(
         composer_data,
         ws_dir,
         composer_header=snapshot.get("composerHeader"),
+        is_pinned=bool(snapshot.get("isPinned", False)),
     )
 
     # ── Step 4: Verify writes ─────────────────────────────────────────
-    verify_cdb = db.CursorDB(global_db_path)
     try:
-        written = verify_cdb.get_json(f"composerData:{composer_id}")
+        written = global_cdb.get_original_json(f"composerData:{composer_id}")
         if not written:
             print("  WARNING: composerData not found in global DB after write!", file=sys.stderr)
             return False
         if bubble_entries:
             sample_key = next(iter(bubble_entries))
-            sample = verify_cdb.get_json(f"bubbleId:{composer_id}:{sample_key}")
+            sample = global_cdb.get_original_json(f"bubbleId:{composer_id}:{sample_key}")
             if not sample:
                 print("  WARNING: bubble entries not found in global DB after write!", file=sys.stderr)
                 return False
         if header_chunks:
             sample_key = next(iter(header_chunks))
-            sample = verify_cdb.get_json(
+            sample = global_cdb.get_original_json(
                 f"composerConvHeaders:{composer_id}:{sample_key}"
             )
             if sample is None:
@@ -554,7 +604,7 @@ def import_snapshot(
         else:
             print(f"  Done: \"{final_name}\" ({final_msgs} msgs)")
     finally:
-        verify_cdb.close()
+        global_cdb.close()
 
     return True
 
@@ -815,14 +865,25 @@ def import_from_snapshot_dir(
     success = 0
     failure = 0
 
-    for sf in snapshot_files:
-        print(f"Importing {sf.name}...")
-        if import_snapshot(sf, target_project_path, ws_dir, skip_backup=True):
-            success += 1
-            print(f"  OK")
-        else:
-            failure += 1
-            print(f"  FAILED")
+    # One stable read copy is enough for conflict checks across the batch.
+    # Snapshot filenames are unique per composer, so writes for one item do
+    # not invalidate conflict data needed by later items.
+    read_cdb = db.CursorDB(global_db_path) if global_db_path.exists() else None
+    try:
+        for sf in snapshot_files:
+            print(f"Importing {sf.name}...")
+            if import_snapshot(
+                sf, target_project_path, ws_dir, skip_backup=True,
+                _read_cdb=read_cdb,
+            ):
+                success += 1
+                print(f"  OK")
+            else:
+                failure += 1
+                print(f"  FAILED")
+    finally:
+        if read_cdb:
+            read_cdb.close()
 
     return success, failure
 
@@ -989,7 +1050,9 @@ def _register_in_global_headers(
         global_cdb.write_composer_header(entry, ws_dir.name)
 
         # Keep the older JSON index working for older Cursor versions.
-        headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
+        headers = global_cdb.get_original_json(
+            "composer.composerHeaders", table="ItemTable"
+        )
         if headers is None:
             headers = {"allComposers": []}
 
@@ -1010,6 +1073,7 @@ def _register_in_workspace(
     composer_data: dict,
     ws_dir: Path,
     composer_header: Optional[dict] = None,
+    is_pinned: bool = False,
 ) -> bool:
     """Register a conversation in a workspace's sidebar.
 
@@ -1023,7 +1087,9 @@ def _register_in_workspace(
     ws_db_path = ws_dir / "state.vscdb"
     ws_cdb = db.CursorDB(ws_db_path)
     try:
-        existing = ws_cdb.get_json("composer.composerData", table="ItemTable")
+        existing = ws_cdb.get_original_json(
+            "composer.composerData", table="ItemTable"
+        )
         if existing is None:
             existing = {"selectedComposerIds": []}
 
@@ -1055,11 +1121,23 @@ def _register_in_workspace(
 
         ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
 
+        if is_pinned:
+            pinned_ids = ws_cdb.get_original_json(
+                "cursor/pinnedComposers", table="ItemTable"
+            )
+            if not isinstance(pinned_ids, list):
+                pinned_ids = []
+            if composer_id not in pinned_ids:
+                pinned_ids.append(composer_id)
+                ws_cdb.write_json(
+                    "cursor/pinnedComposers", pinned_ids, table="ItemTable"
+                )
+
         # Cursor 3.0+: register in the global headers index. A workspace may
         # still contain an old allComposers value after Cursor creates the
         # dedicated global SQL table, so detect the global schema as well.
         with db.CursorDB(paths.get_global_db_path()) as global_cdb:
-            has_modern_headers = global_cdb.table_exists("composerHeaders")
+            has_modern_headers = global_cdb.original_table_exists("composerHeaders")
         if is_migrated or has_modern_headers:
             _register_in_global_headers(composer_id, composer_data, ws_dir, composer_header)
 

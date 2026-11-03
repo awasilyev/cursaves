@@ -1070,6 +1070,7 @@ def _pull_behind(sync_dir: Path) -> int:
                         sf, ws["path"],
                         target_workspace_dir=ws["workspace_dir"],
                         skip_backup=True,
+                        _read_cdb=global_cdb,
                     )
                     if ok:
                         total_imported += 1

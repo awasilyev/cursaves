@@ -157,6 +157,39 @@ class CursorDB:
         except json.JSONDecodeError:
             return None
 
+    def get_original_json(self, key: str, table: str = "cursorDiskKV") -> Optional[Any]:
+        """Read JSON through the original-DB connection used for writes.
+
+        Import code uses this only after it has committed writes to the original
+        database.  Unlike :meth:`get_json`, it avoids making another full
+        temporary copy merely to verify or extend those writes.
+        """
+        conn = self._get_write_conn()
+        try:
+            row = conn.execute(
+                f"SELECT value FROM {table} WHERE key = ?", (key,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if row is None:
+            return None
+        value = row[0]
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+    def original_table_exists(self, table: str) -> bool:
+        """Check a table on the original DB without creating a read copy."""
+        conn = self._get_write_conn()
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
     def table_exists(self, table: str) -> bool:
         """Return whether a table exists in the database."""
         conn = self._ensure_read_copy()
